@@ -9,13 +9,17 @@ const $ = (id) => document.getElementById(id);
 const HIDDEN_BALANCE = '\u2022\u2022\u2022\u2022\u2022\u2022';
 
 let LANG = 'en-GH';
+let countryCatalog = [];
 
 const app = {
   currency: 'GHS',
+  country: 'GH',
+  authenticated: false,
+  accountIdentity: null,
   registered: false,
+  addingDevice: false,
   txn: null,
   regOptions: null,
-  setupToken: null,
   revealOptions: null,
   revealAt: 0,
   revealTimer: null,
@@ -27,6 +31,11 @@ const app = {
   challengeTimer: null,
   voiceTimer: null,
   recognizer: null,
+  mediaRecorder: null,
+  mediaStream: null,
+  audioChunks: [],
+  recording: false,
+  forceRecorder: false,
   listening: false,
   approving: false,
   busy: false,
@@ -76,11 +85,22 @@ async function api(path, body) {
   return data;
 }
 
+async function apiUpload(path, form) {
+  let res;
+  try { res = await fetch(path, { method: 'POST', body: form }); }
+  catch (e) { throw new Error('VoicePay could not connect. Check your connection and try again.'); }
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* ignore a non-JSON reply */ }
+  if (!res.ok) {
+    const err = new Error((data && (data.error || data.message)) || 'Request failed (' + res.status + ').');
+    err.data = data || {}; err.status = res.status; throw err;
+  }
+  return data;
+}
+
 function formatMoney(value) {
-  return app.currency + ' ' + Number(value).toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
+  try { return new Intl.NumberFormat('en-' + app.country, { style: 'currency', currency: app.currency }).format(Number(value)); }
+  catch (e) { return app.currency + ' ' + Number(value).toLocaleString(); }
 }
 
 function say(text, kind) {
@@ -89,10 +109,11 @@ function say(text, kind) {
   el.className = 'status' + (kind ? ' ' + kind : '');
 }
 
-const VIEWS = ['home', 'about', 'pay', 'balance', 'history', 'setup', 'settings'];
+const VIEWS = ['home', 'about', 'pay', 'balance', 'history', 'setup', 'settings', 'account'];
 
 function navigate(view, push) {
   if (!VIEWS.includes(view)) view = 'home';
+  if (!app.authenticated && ['pay', 'balance', 'history', 'setup', 'settings'].includes(view)) view = 'account';
   if (view !== 'balance') hideBalance();
   if (view !== 'history') hideHistory();
   document.querySelectorAll('[data-screen]').forEach((screen) => {
@@ -108,6 +129,30 @@ function navigate(view, push) {
   if (push !== false && location.hash !== '#' + view) history.pushState({ view }, '', '#' + view);
   if (view === 'balance') prefetchReveal();
   if (view === 'history') prefetchHistory();
+}
+
+function clearClientFlow() {
+  if (app.voiceTimer) { clearTimeout(app.voiceTimer); app.voiceTimer = null; }
+  if (app.recognizer && app.listening) app.recognizer.abort();
+  if (app.mediaRecorder && app.recording) {
+    app.mediaRecorder.onstop = null;
+    try { app.mediaRecorder.stop(); } catch (e) { /* already stopped */ }
+    cleanupRecording();
+  }
+  app.addingDevice = false;
+  app.busy = false;
+  app.txn = null;
+  app.lastPayment = null;
+  app.recentContacts = [];
+  app.revealOptions = null;
+  app.historyOptions = null;
+  $('log').textContent = '';
+  $('receipt').hidden = true;
+  hideTicket();
+  hideBalance();
+  hideHistory();
+  setChips(startChips());
+  addMessage('bot', 'Who would you like to pay?');
 }
 
 function webauthnProblem(e) {
@@ -155,9 +200,16 @@ function speak(text) {
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       u.lang = LANG;
+      u.rate = 0.96;
+      const voices = window.speechSynthesis.getVoices();
+      const wanted = LANG.toLowerCase();
+      u.voice = voices.find((voice) => voice.lang.toLowerCase() === wanted)
+        || voices.find((voice) => voice.lang.toLowerCase().startsWith(wanted.split('-')[0]))
+        || null;
       u.onend = resolve;
       u.onerror = resolve;
-      setTimeout(resolve, 12000); // some browsers never fire onend
+      window.speechSynthesis.resume();
+      setTimeout(resolve, Math.max(8000, Math.min(20000, text.length * 110)));
       window.speechSynthesis.speak(u);
     } catch (e) { resolve(); }
   });
@@ -194,6 +246,11 @@ async function handleCommand(text, shown) {
     app.busy = false;
     await botSay(r.message, r.expects);
   } catch (e) {
+    if (e.data && e.data.auth_required) {
+      navigate('account');
+      say('Verify your phone number to continue.', 'error');
+      return;
+    }
     addMessage('bot', e.message + ' You can retry or type your message.', true);
   } finally {
     app.busy = false;
@@ -225,10 +282,18 @@ function renderHistory(items) {
 
 async function refresh() {
   const s = await api('/api/state');
+  if (app.accountIdentity && s.authenticated && s.account_identity !== app.accountIdentity) clearClientFlow();
   app.currency = s.currency;
+  app.country = s.country || 'GH';
+  app.authenticated = Boolean(s.authenticated);
+  if (s.authenticated) app.accountIdentity = s.account_identity;
   app.registered = s.registered;
-  $('setup-box').hidden = s.registered;
-  $('setup-complete').hidden = !s.registered;
+  $('setup-box').hidden = !s.authenticated || (s.registered && !app.addingDevice);
+  $('setup-complete').hidden = !s.authenticated || !s.registered || app.addingDevice;
+  $('account-ready').hidden = !s.authenticated;
+  $('account-form').hidden = Boolean(s.authenticated);
+  $('account-currency').textContent = s.currency || '';
+  $('balance-caption').textContent = 'AVAILABLE · ' + (s.currency || 'DEMO') + ' SIMULATED';
   $('reset').hidden = !s.reset_enabled;
   $('engine').textContent = s.ai ? 'Enhanced command understanding available' : 'Basic command understanding';
   if (s.registered && !app.revealOptions) prefetchReveal();
@@ -239,6 +304,84 @@ async function refresh() {
       prefetchHistory();
     }, 80000);
   }
+  if (!s.authenticated && ['pay', 'balance', 'history', 'setup', 'settings'].includes(location.hash.slice(1))) {
+    navigate('account', false);
+  }
+}
+
+async function loadCountryOptions() {
+  try {
+    const response = await fetch('/api/countries');
+    if (!response.ok) throw new Error('Country list unavailable');
+    const data = await response.json();
+    countryCatalog = data.countries || [];
+    const select = $('country-select');
+    select.textContent = '';
+    countryCatalog.forEach((item) => {
+      const option = document.createElement('option');
+      option.value = item.code;
+      option.textContent = item.name + ' (' + item.dial + ')';
+      option.dataset.currency = item.currency;
+      option.dataset.currencyName = item.currency_name;
+      select.appendChild(option);
+    });
+    select.value = app.country || 'GH';
+    updateCurrencyPreview();
+  } catch (e) {
+    say('Could not load countries. Refresh the page and try again.', 'error');
+  }
+}
+
+function updateCurrencyPreview() {
+  const item = countryCatalog.find((entry) => entry.code === $('country-select').value);
+  if (!item) return;
+  $('currency-preview').textContent = 'Currency · ' + item.currency + ' ' + item.currency_symbol;
+  app.country = item.code;
+  app.currency = item.currency;
+  $('phone-number').placeholder = 'Number including area code';
+}
+
+async function sendPhoneCode() {
+  const phone = $('phone-number').value.trim();
+  const country = $('country-select').value;
+  $('send-code').disabled = true;
+  try {
+    await api('/api/auth/start', { phone, country });
+    $('code-group').hidden = false;
+    $('phone-code').focus();
+    say('Code sent. Check your text messages.', 'ok');
+  } catch (e) { say(e.message, 'error'); }
+  finally { $('send-code').disabled = false; }
+}
+
+async function verifyPhoneCode() {
+  const phone = $('phone-number').value.trim();
+  const country = $('country-select').value;
+  const code = $('phone-code').value.trim();
+  $('verify-code').disabled = true;
+  try {
+    await api('/api/auth/verify', { phone, country, code });
+    await refresh();
+    navigate(app.registered ? 'home' : 'setup');
+    say(app.registered ? 'Phone verified.' : 'Phone verified. Add device approval to continue.', 'ok');
+  } catch (e) { say(e.message, 'error'); }
+  finally { $('verify-code').disabled = false; }
+}
+
+async function logout() {
+  try { await api('/api/auth/logout', {}); } catch (e) { /* still clear the local view */ }
+  app.authenticated = false;
+  app.registered = false;
+  app.accountIdentity = null;
+  hideTicket();
+  $('receipt').hidden = true;
+  $('phone-number').value = '';
+  $('phone-code').value = '';
+  $('code-group').hidden = true;
+  clearClientFlow();
+  navigate('account');
+  await refresh();
+  say('Signed out.', 'ok');
 }
 
 /* ---------- Face ID / Touch ID registration ---------- */
@@ -256,20 +399,13 @@ async function prepareSetup() {
     say('Face ID / Touch ID needs https or localhost. Open the https link from your tunnel.', 'error');
     return;
   }
-  const token = $('setup-token').value.trim();
-  if (!token) {
-    say('Enter the owner setup token first.', 'error');
-    return;
-  }
-  app.setupToken = token;
   $('setup-prepare').disabled = true;
   try {
-    app.regOptions = await api('/api/register/options', { setup_token: token });
+    app.regOptions = await api('/api/register/options', {});
     $('setup-scan').hidden = false;
     $('setup-scan').focus();
     say('Ready. Continue with Step 2 to scan your face or fingerprint.', 'ok');
   } catch (e) {
-    app.setupToken = null;
     say(e.message, 'error');
   } finally {
     $('setup-prepare').disabled = false;
@@ -277,7 +413,7 @@ async function prepareSetup() {
 }
 
 async function scanSetup() {
-  if (!canUseBiometrics() || !app.regOptions || !app.setupToken) return;
+  if (!canUseBiometrics() || !app.regOptions) return;
   const publicKey = decodeCreationOptions(app.regOptions);
   app.regOptions = null;
   $('setup-scan').disabled = true;
@@ -295,10 +431,9 @@ async function scanSetup() {
       },
     };
     if (cred.authenticatorAttachment) payload.authenticatorAttachment = cred.authenticatorAttachment;
-    await api('/api/register/verify', { setup_token: app.setupToken, credential: payload });
-    app.setupToken = null;
-    $('setup-token').value = '';
+    await api('/api/register/verify', { credential: payload });
     $('setup-scan').hidden = true;
+    app.addingDevice = false;
     say('');
     await refresh();
     const resumed = await api('/api/resume', {});
@@ -308,10 +443,9 @@ async function scanSetup() {
       await botSay('Your saved payment is ready. Review the details, then approve. ' + resumed.speech, 'confirm');
     } else {
       setChips(resumed.chips || []);
-      await botSay('Face ID / Touch ID is ready. ' + resumed.message, resumed.expects);
+      await botSay('Device approval is ready. ' + resumed.message, resumed.expects);
     }
   } catch (e) {
-    app.setupToken = null;
     $('setup-scan').hidden = true;
     say(e.data ? e.message : webauthnProblem(e), 'error');
   } finally {
@@ -500,7 +634,8 @@ function setListening(on) {
 }
 
 function startListening() {
-  if (!Recognition || app.listening || app.approving || app.busy) return;
+  if (app.listening || app.approving || app.busy) return;
+  if (!Recognition) { say('Tap the mic to record your reply, or type it.'); return; }
   if (window.speechSynthesis) window.speechSynthesis.cancel();
 
   const rec = new Recognition();
@@ -529,7 +664,7 @@ function startListening() {
   };
   rec.onerror = (event) => {
     failed = true;
-    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+    if (event.error === 'not-allowed') {
       app.sound = false;
       $('sound').textContent = 'Voice replies off';
       say('Microphone access was blocked. Allow the microphone for this site, or type instead.', 'error');
@@ -537,7 +672,12 @@ function startListening() {
       LANG = 'en-US';
       say('That language is not supported here. Switched to US English. Tap the mic again.', 'error');
     } else if (event.error === 'network') {
-      say('Voice recognition needs an internet connection. You can type instead.', 'error');
+      app.forceRecorder = true;
+      say('Browser voice input failed. Tap the mic to record with VoicePay instead.', 'error');
+      $('mic').setAttribute('aria-label', 'Record voice with VoicePay');
+    } else if (event.error === 'service-not-allowed') {
+      app.forceRecorder = true;
+      say('Browser voice input is unavailable. Tap the mic to record with VoicePay instead.', 'error');
     } else if (event.error !== 'aborted' && event.error !== 'no-speech') {
       say('Voice input failed (' + event.error + '). You can type instead.', 'error');
     }
@@ -552,12 +692,60 @@ function startListening() {
 
 function onMic() {
   if (app.listening && app.recognizer) { app.recognizer.stop(); return; }
-  if (!Recognition) {
+  if (app.recording && app.mediaRecorder) { app.mediaRecorder.stop(); return; }
+  if (app.forceRecorder || !Recognition) startRecording(); else startListening();
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
     $('typed').focus();
-    say('Voice input is not supported in this browser. Type instead.', 'error');
+    say('Voice recording is unavailable here. Allow microphone access or type your message.', 'error');
     return;
   }
-  startListening();
+  try {
+    app.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const types = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus'];
+    const mimeType = types.find((type) => MediaRecorder.isTypeSupported(type));
+    app.mediaRecorder = mimeType ? new MediaRecorder(app.mediaStream, { mimeType }) : new MediaRecorder(app.mediaStream);
+    app.audioChunks = [];
+    app.mediaRecorder.ondataavailable = (event) => { if (event.data && event.data.size) app.audioChunks.push(event.data); };
+    app.mediaRecorder.onstop = finishRecording;
+    app.mediaRecorder.start();
+    app.recording = true;
+    setListening(true);
+    $('mic').setAttribute('aria-label', 'Stop recording');
+    say('Recording. Tap the mic when finished.');
+  } catch (e) {
+    cleanupRecording();
+    say('Microphone access is blocked or unavailable. Allow it for this site, or type instead.', 'error');
+  }
+}
+
+async function finishRecording() {
+  const recorder = app.mediaRecorder;
+  const chunks = app.audioChunks;
+  const blob = new Blob(chunks, { type: recorder && recorder.mimeType || 'audio/webm' });
+  cleanupRecording();
+  if (!blob.size) { say('No speech was recorded. Try again or type instead.', 'error'); return; }
+  say('Transcribing…');
+  const ext = blob.type.includes('mp4') ? 'mp4' : blob.type.includes('ogg') ? 'ogg' : 'webm';
+  const form = new FormData();
+  form.append('audio', blob, 'voice.' + ext);
+  form.append('language', LANG);
+  try {
+    const result = await apiUpload('/api/transcribe', form);
+    queueVoiceTranscript(result.text);
+  } catch (e) { say(e.message, 'error'); }
+}
+
+function cleanupRecording() {
+  if (app.mediaStream) app.mediaStream.getTracks().forEach((track) => track.stop());
+  app.mediaStream = null;
+  app.mediaRecorder = null;
+  app.audioChunks = [];
+  app.recording = false;
+  setListening(false);
+  $('mic').setAttribute('aria-label', 'Speak');
 }
 
 function queueVoiceTranscript(transcript) {
@@ -707,6 +895,10 @@ async function onReset() {
 }
 
 function onSound() {
+  if (!app.sound && (!window.speechSynthesis || !window.SpeechSynthesisUtterance)) {
+    say('Spoken replies are not supported in this browser.', 'error');
+    return;
+  }
   app.sound = !app.sound;
   if (!app.sound && window.speechSynthesis) window.speechSynthesis.cancel();
   if (!app.sound && app.recognizer && app.listening) app.recognizer.abort();
@@ -714,6 +906,7 @@ function onSound() {
   $('sound-setting').setAttribute('aria-pressed', String(app.sound));
   $('sound').setAttribute('aria-label', app.sound ? 'Turn voice replies off' : 'Turn voice replies on');
   say(app.sound ? 'Voice replies and automatic listening are on.' : 'Voice replies are off. Tap the mic to speak, or type.', 'ok');
+  if (app.sound) speak('Voice replies are on.');
 }
 
 function startChips() {
@@ -749,6 +942,17 @@ async function start() {
   $('repeat-payment').addEventListener('click', onRepeatLastPayment);
   $('sound').addEventListener('click', onSound);
   $('sound-setting').addEventListener('click', onSound);
+  $('add-device').addEventListener('click', () => {
+    app.addingDevice = true;
+    $('setup-complete').hidden = true;
+    $('setup-box').hidden = false;
+    $('setup-prepare').focus();
+  });
+  $('country-select').addEventListener('change', updateCurrencyPreview);
+  $('send-code').addEventListener('click', sendPhoneCode);
+  $('verify-code').addEventListener('click', verifyPhoneCode);
+  $('logout').addEventListener('click', logout);
+  $('logout-settings').addEventListener('click', logout);
   $('sound').textContent = '♫';
   $('sound').setAttribute('aria-pressed', 'false');
   $('language').value = LANG;
@@ -759,13 +963,9 @@ async function start() {
 
   if (!window.isSecureContext) {
     say('This page is not on https, so Face ID / Touch ID will not work. Use localhost or an https tunnel.', 'error');
-  } else if (window.PublicKeyCredential && PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) {
-    try {
-      const ok = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
-      if (!ok) $('setup-text').textContent = 'This device has no Face ID, Touch ID or screen lock set up. Turn one on in your device settings first.';
-    } catch (e) { /* ignore: the setup button still works */ }
   }
 
+  await loadCountryOptions();
   try { await refresh(); } catch (e) { say(e.message, 'error'); }
 }
 

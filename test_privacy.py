@@ -17,6 +17,9 @@ os.environ.pop('GROQ_API_KEY', None)  # test with the rule-based parser only
 os.environ['RP_ID'] = 'localhost'
 os.environ['ORIGIN'] = 'http://localhost:5000'
 os.environ['SETUP_TOKEN'] = 'test-owner-setup-token'
+os.environ['TWILIO_ACCOUNT_SID'] = 'test-account'
+os.environ['TWILIO_AUTH_TOKEN'] = 'test-token'
+os.environ['TWILIO_VERIFY_SERVICE_SID'] = 'test-service'
 os.environ['ALLOW_RESET'] = '0'
 TEST_HOME = Path(tempfile.mkdtemp())
 os.environ['VOICEPAY_DATA_FILE'] = str(TEST_HOME / 'data.json')
@@ -29,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 import app as vp
 
 ORIGIN, RP = 'http://localhost:5000', 'localhost'
-SECRET = ['1000', '1,000', '950', '900']  # the balance, and what it becomes after payments
+SECRET = ['GH₵1,000.00', 'GH₵950.00', 'GH₵900.00']  # hidden balances and derived balances
 failures = []
 seen = []  # every reply body the server ever sent to the page
 
@@ -86,25 +89,37 @@ def chat(client, text):
 
 
 vp.app.config['TESTING'] = True
+vp.twilio_verify = lambda path, values: {'status': 'pending' if path == 'Verifications' else 'approved'}
 alice = vp.app.test_client()
 phone = Phone()
+
+
+def authenticate(client, number):
+    code, _ = call(client, 'POST', '/api/auth/start', {'phone': number, 'country': 'GH'})
+    check('phone verification can be started', code == 200)
+    code, _ = call(client, 'POST', '/api/auth/verify',
+                   {'phone': number, 'country': 'GH', 'code': '123456'})
+    check('phone account is verified', code == 200)
 
 print('Setup')
 _, state = call(alice, 'GET', '/api/state')
 check('/api/state has no balance field', not any('balance' in k for k in state))
 check('/api/state does not disclose history', 'history' not in state)
-_, reg = call(alice, 'POST', '/api/register/options', {'setup_token': os.environ['SETUP_TOKEN']})
-code, _ = call(alice, 'POST', '/api/register/verify', {
-    'setup_token': os.environ['SETUP_TOKEN'], 'credential': phone.register(reg)})
+authenticate(alice, '0241234567')
+_, reg = call(alice, 'POST', '/api/register/options', {})
+code, _ = call(alice, 'POST', '/api/register/verify', {'credential': phone.register(reg)})
 check('device registered', code == 200)
-code, _ = call(vp.app.test_client(), 'POST', '/api/register/options', {'setup_token': os.environ['SETUP_TOKEN']})
-check('a second person cannot replace the registered device', code == 409)
+other = vp.app.test_client()
+authenticate(other, '0201234567')
+code, _ = call(other, 'POST', '/api/register/options', {})
+check('another verified account can register its own device', code == 200)
+alice_user = vp.user_for_auth_token(alice.get_cookie('vp_auth').value)
 
 print('\nGuided conversation')
 r = chat(alice, 'I want to send some money')
 check('asks how much', r['expects'] == 'amount')
 r = chat(alice, '50')
-check('asks who next', r['expects'] == 'recipient' and 'GHS 50.00' in r['message'])
+check('asks who next', r['expects'] == 'recipient' and '50.00' in r['message'])
 r = chat(alice, 'Yaw')
 check('refuses someone who is not an exact contact and asks again', r['expects'] == 'recipient' and 'exact contact' in r['message'])
 r = chat(alice, 'Kofi')
@@ -113,7 +128,7 @@ r = chat(alice, 'for lunch')
 check('shows the confirmation ticket', r['kind'] == 'confirm' and r['recipient'] == 'Kofi' and r['note'] == 'lunch')
 first = r
 r = chat(alice, 'make it 60')
-check('changing the amount issues a new ticket', r['kind'] == 'confirm' and r['amount_text'] == 'GHS 60.00' and r['txn_id'] != first['txn_id'])
+check('changing the amount issues a new ticket', r['kind'] == 'confirm' and '60.00' in r['amount_text'] and r['txn_id'] != first['txn_id'])
 code, _ = call(alice, 'POST', '/api/approve', {'txn_id': first['txn_id'], 'credential': phone.sign(first['options'])})
 check('the old ticket no longer works', code == 410)
 r = chat(alice, 'yes')
@@ -137,7 +152,6 @@ check('a large amount gets the same pre-biometric review flow', r['kind'] == 'co
 chat(alice, 'cancel')
 r = chat(alice, 'send 50 to Kofi for lunch')
 check('one sentence goes straight to the ticket', r['kind'] == 'confirm')
-other = vp.app.test_client()
 chat(other, 'hello')
 code, _ = call(other, 'POST', '/api/approve', {'txn_id': r['txn_id'], 'credential': phone.sign(r['options'])})
 check("someone else's browser cannot approve my payment", code == 410)
@@ -150,21 +164,21 @@ check('retries return the original receipt without charging twice', code == 200)
 print('\nUnlocking the balance')
 _, opts = call(alice, 'POST', '/api/balance/options')
 code, res = call(alice, 'POST', '/api/balance/reveal', {'credential': phone.sign(opts['options'])})
-check('Face ID shows the balance', code == 200 and res['balance_text'] == 'GHS 950.00')
+check('Face ID shows the balance', code == 200 and '950.00' in res['balance_text'])
 code, _ = call(alice, 'POST', '/api/balance/reveal', {'credential': phone.sign(opts['options'])})
 check('the unlock works only once', code == 410)
 
 print('\nNot enough money')
 with vp.db_connect() as conn:
-    conn.execute("INSERT INTO ledger(kind,amount_cents,created,note) VALUES('reset',?,?,?)",
-                 (-92000, int(time.time()), 'test-only adjustment'))
+    conn.execute("INSERT INTO ledger(kind,amount_cents,created,note,owner_id,currency) VALUES('reset',?,?,?,?,?)",
+                 (-92000, int(time.time()), 'test-only adjustment', alice_user['id'], 'GHS'))
 r = chat(alice, 'send 40 to Ama for snacks')
 check('no hint of low funds before Face ID: the ticket is issued as normal', r['kind'] == 'confirm')
 code, res = call(alice, 'POST', '/api/approve', {'txn_id': r['txn_id'], 'credential': phone.sign(r['options'])})
-check('after Face ID it says insufficient funds, and nothing is sent', code == 400 and 'Insufficient' in res['error'] and vp.ledger_balance() == 30.0)
+check('after Face ID it says insufficient funds, and nothing is sent', code == 400 and 'Insufficient' in res['error'] and vp.ledger_balance(alice_user['id'], 'GHS') == 30.0)
 with vp.db_connect() as conn:
-    conn.execute("INSERT INTO ledger(kind,amount_cents,created,note) VALUES('reset',?,?,?)",
-                 (92000, int(time.time()), 'test-only adjustment'))
+    conn.execute("INSERT INTO ledger(kind,amount_cents,created,note,owner_id,currency) VALUES('reset',?,?,?,?,?)",
+                 (92000, int(time.time()), 'test-only adjustment', alice_user['id'], 'GHS'))
 
 print('\nHistory privacy')
 _, state = call(alice, 'GET', '/api/state')

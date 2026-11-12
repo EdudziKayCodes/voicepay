@@ -21,6 +21,7 @@ Balance privacy
 """
 import base64
 from contextlib import closing
+from datetime import date
 import hashlib
 import hmac
 import json
@@ -31,12 +32,18 @@ import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
+import phonenumbers
+from babel import Locale
+from babel.numbers import format_currency, get_currency_name, get_currency_precision, get_territory_currencies
 
 try:  # optional: read settings from a .env file next to this script
     from dotenv import load_dotenv
@@ -83,11 +90,7 @@ MODELS = [
 RP_ID = os.environ.get('RP_ID', 'localhost').strip()
 ORIGINS = [o.strip().rstrip('/') for o in os.environ.get('ORIGIN', 'http://localhost:5000').split(',') if o.strip()]
 RP_NAME = 'VoicePay'
-USER_ID = b'voicepay-demo-user'
-USER_NAME = 'demo@voicepay'
-
 CURRENCY = 'GHS'
-CURRENCY_WORD = 'cedis'  # used when the app speaks
 STARTING_BALANCE = 1000.00
 DAILY_LIMIT = 500.00
 PENDING_TTL = 120  # seconds a pending payment stays valid
@@ -95,8 +98,12 @@ MAX_AMOUNT = 1_000_000
 REVEAL_SECONDS = 10  # how long the page may show the balance after a biometric unlock
 DIALOG_TTL = 900  # forget an unfinished conversation after 15 minutes
 ALLOW_RESET = os.environ.get('ALLOW_RESET', '0') == '1'  # opt in only for controlled demos
-ALLOW_REREGISTER = os.environ.get('ALLOW_REREGISTER', '0') == '1'  # let a new device replace the old one
 SETUP_TOKEN = os.environ.get('SETUP_TOKEN', '').strip()
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
+TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
+TWILIO_VERIFY_SERVICE_SID = os.environ.get('TWILIO_VERIFY_SERVICE_SID', '').strip()
+AUTH_SESSION_DAYS = 30
+AUDIO_MODEL = os.environ.get('AUDIO_MODEL', 'whisper-large-v3-turbo').strip()
 
 CONTACTS = ['Kofi', 'Ama', 'Mum', 'Kwame']
 ALIASES = {'mom': 'Mum', 'mother': 'Mum', 'mummy': 'Mum', 'mama': 'Mum'}
@@ -115,14 +122,14 @@ except ImportError:
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # always serve fresh files while developing
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 proxy_hops = int(os.environ.get('PROXY_FIX_HOPS', '0'))
 if proxy_hops:
     # Trust forwarded client IP and scheme only when the hosting proxy count is configured.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=proxy_hops, x_proto=proxy_hops, x_host=0, x_port=0, x_prefix=0)
 
 # --------------------------------------------------------------------------
-# Runtime challenges and conversations are short-lived. Durable payments live in SQLite;
-# only the demo WebAuthn credential remains in data.json.
+# Runtime challenges and conversations are short-lived. User accounts, credentials, and ledgers live in SQLite.
 # --------------------------------------------------------------------------
 LOCK = threading.RLock()
 PENDING = {}  # payment id -> pending payment (memory only, short lived)
@@ -132,54 +139,8 @@ DIALOGS = {}  # session id -> the conversation in progress
 FAILS = {}  # session id -> failed biometric attempts
 HITS = {}  # client address -> recent request times (rate limit)
 REG = {}  # registration challenges are per browser session
+PHONE_PENDING = {}  # phone verification attempts; provider owns OTP lifecycle
 SESSION_LOCKS = [threading.RLock() for _ in range(256)]
-
-
-def b64e(raw):
-    return base64.b64encode(raw).decode('ascii')
-
-
-def b64d(text):
-    return base64.b64decode(text.encode('ascii'))
-
-
-def default_state():
-    return {'credential': None}
-
-
-def load_state():
-    try:
-        raw = json.loads(DATA_FILE.read_text(encoding='utf-8'))
-        cred = raw.get('credential')
-        if cred and cred.get('rp_id') == RP_ID:
-            cred = {
-                'id': b64d(cred['id']),
-                'public_key': b64d(cred['public_key']),
-                'sign_count': int(cred['sign_count']),
-                'rp_id': cred['rp_id'],
-            }
-        else:
-            cred = None  # registered on another domain: it cannot be used here
-        return {'credential': cred}
-    except (OSError, ValueError, KeyError, TypeError):
-        return default_state()
-
-
-def save_state():
-    cred = STATE['credential']
-    raw = {
-        'credential': None
-        if cred is None
-        else {
-            'id': b64e(cred['id']),
-            'public_key': b64e(cred['public_key']),
-            'sign_count': cred['sign_count'],
-            'rp_id': cred['rp_id'],
-        },
-    }
-    tmp = DATA_FILE.with_suffix('.tmp')
-    tmp.write_text(json.dumps(raw, indent=2), encoding='utf-8')
-    os.replace(tmp, DATA_FILE)
 
 
 def db_connect():
@@ -202,13 +163,44 @@ def initialize_ledger():
                 note TEXT NOT NULL DEFAULT '',
                 created INTEGER NOT NULL,
                 idempotency_key TEXT UNIQUE,
-                session_id TEXT
+                session_id TEXT,
+                owner_id TEXT NOT NULL DEFAULT '__legacy__',
+                currency TEXT NOT NULL DEFAULT 'GHS'
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                phone TEXT NOT NULL UNIQUE,
+                country TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                created INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS passkeys (
+                credential_id BLOB PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                public_key BLOB NOT NULL,
+                sign_count INTEGER NOT NULL DEFAULT 0,
+                rp_id TEXT NOT NULL,
+                created INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS passkeys_by_user ON passkeys(user_id);
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                expires INTEGER NOT NULL,
+                created INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS auth_sessions_by_user ON auth_sessions(user_id);
             CREATE TRIGGER IF NOT EXISTS ledger_no_update
             BEFORE UPDATE ON ledger BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS ledger_no_delete
             BEFORE DELETE ON ledger BEGIN SELECT RAISE(ABORT, 'ledger is append-only'); END;
         ''')
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(ledger)').fetchall()}
+        if 'owner_id' not in columns:
+            conn.execute("ALTER TABLE ledger ADD COLUMN owner_id TEXT NOT NULL DEFAULT '__legacy__'")
+        if 'currency' not in columns:
+            conn.execute("ALTER TABLE ledger ADD COLUMN currency TEXT NOT NULL DEFAULT 'GHS'")
+        conn.execute('CREATE INDEX IF NOT EXISTS ledger_by_user ON ledger(owner_id,currency,created)')
         if conn.execute('SELECT COUNT(*) FROM ledger').fetchone()[0] == 0:
             legacy = {}
             try:
@@ -229,12 +221,12 @@ def initialize_ledger():
                 except (KeyError, TypeError, ValueError):
                     continue
             opening_cents = balance_cents + sum(row[0] for row in payment_rows)
-            conn.execute('INSERT INTO ledger(kind,amount_cents,created) VALUES(?,?,?)',
-                         ('opening', opening_cents, int(time.time())))
+            conn.execute('INSERT INTO ledger(kind,amount_cents,created,owner_id,currency) VALUES(?,?,?,?,?)',
+                         ('opening', opening_cents, int(time.time()), '__legacy__', 'GHS'))
             for index, (cents, recipient, note, stamp) in enumerate(payment_rows):
-                conn.execute('''INSERT INTO ledger(kind,amount_cents,recipient,note,created,idempotency_key)
-                                VALUES('payment',?,?,?,?,?)''',
-                             (-cents, recipient, note, stamp, 'legacy-' + str(index)))
+                conn.execute('''INSERT INTO ledger(kind,amount_cents,recipient,note,created,idempotency_key,owner_id,currency)
+                                VALUES('payment',?,?,?,?,?,?,?)''',
+                             (-cents, recipient, note, stamp, 'legacy-' + str(index), '__legacy__', 'GHS'))
         try:
             raw_state = json.loads(DATA_FILE.read_text(encoding='utf-8'))
             if isinstance(raw_state, dict) and ('balance' in raw_state or 'history' in raw_state):
@@ -248,70 +240,205 @@ def initialize_ledger():
         conn.close()
 
 
-def ledger_balance(conn=None):
+def current_currency(default=CURRENCY):
+    try:
+        return g.currency
+    except RuntimeError:
+        return default
+
+
+def current_user_id(default='__legacy__'):
+    try:
+        return g.user_id or default
+    except RuntimeError:
+        return default
+
+
+def minor_factor(currency=None):
+    return 10 ** get_currency_precision(currency or current_currency())
+
+
+def ensure_user_ledger(user_id, currency):
+    factor = minor_factor(currency)
+    with closing(db_connect()) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        exists = conn.execute('SELECT 1 FROM ledger WHERE owner_id=? AND currency=? LIMIT 1',
+                              (user_id, currency)).fetchone()
+        if not exists:
+            conn.execute('INSERT INTO ledger(kind,amount_cents,created,owner_id,currency) VALUES(?,?,?,?,?)',
+                         ('opening', int(round(STARTING_BALANCE * factor)), int(time.time()), user_id, currency))
+        conn.commit()
+
+
+def ledger_balance(user_id=None, currency=None, conn=None):
+    user_id = user_id or current_user_id()
+    currency = currency or current_currency()
+    factor = minor_factor(currency)
     own = conn is None
     conn = conn or db_connect()
     try:
-        cents = conn.execute('SELECT COALESCE(SUM(amount_cents),0) FROM ledger').fetchone()[0]
-        return round(cents / 100.0, 2)
+        cents = conn.execute('SELECT COALESCE(SUM(amount_cents),0) FROM ledger WHERE owner_id=? AND currency=?',
+                             (user_id, currency)).fetchone()[0]
+        return round(cents / factor, get_currency_precision(currency))
     finally:
         if own:
             conn.close()
 
 
-def spent_today(conn=None):
+def spent_today(user_id=None, currency=None, conn=None):
+    user_id = user_id or current_user_id()
+    currency = currency or current_currency()
     own = conn is None
     conn = conn or db_connect()
     try:
         since = int(time.time() - 86400)
-        cents = conn.execute("SELECT COALESCE(SUM(-amount_cents),0) FROM ledger WHERE kind='payment' AND created>?",
-                             (since,)).fetchone()[0]
-        return round(cents / 100.0, 2)
+        cents = conn.execute("SELECT COALESCE(SUM(-amount_cents),0) FROM ledger "
+                             "WHERE kind='payment' AND owner_id=? AND currency=? AND created>?",
+                             (user_id, currency, since)).fetchone()[0]
+        return round(cents / minor_factor(currency), get_currency_precision(currency))
     finally:
         if own:
             conn.close()
 
 
-def ledger_history(limit=8):
+def ledger_history(user_id=None, currency=None, limit=8):
+    user_id = user_id or current_user_id()
+    currency = currency or current_currency()
+    factor = minor_factor(currency)
     with closing(db_connect()) as conn:
         rows = conn.execute("SELECT recipient AS 'to',amount_cents,note,created AS time,idempotency_key AS reference "
-                            "FROM ledger WHERE kind='payment' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    return [{'to': r['to'], 'amount': round(-r['amount_cents'] / 100, 2), 'note': r['note'],
+                            "FROM ledger WHERE kind='payment' AND owner_id=? AND currency=? ORDER BY id DESC LIMIT ?",
+                            (user_id, currency, limit)).fetchall()
+    return [{'to': r['to'], 'amount': round(-r['amount_cents'] / factor, get_currency_precision(currency)), 'note': r['note'],
              'time': r['time'], 'reference': r['reference']} for r in reversed(rows)]
 
 
-def ledger_payment(key, sid):
+def ledger_payment(key, sid, user_id=None, currency=None):
+    user_id = user_id or current_user_id()
+    currency = currency or current_currency()
+    factor = minor_factor(currency)
     with closing(db_connect()) as conn:
         row = conn.execute("SELECT recipient AS 'to',amount_cents,note,created AS time,idempotency_key AS reference "
-                           "FROM ledger WHERE kind='payment' AND idempotency_key=? AND session_id=?", (key, sid)).fetchone()
+                           "FROM ledger WHERE kind='payment' AND idempotency_key=? AND session_id=? AND owner_id=? AND currency=?",
+                           (key, sid, user_id, currency)).fetchone()
     if row is None:
         return None
-    return {'to': row['to'], 'amount': round(-row['amount_cents'] / 100, 2), 'note': row['note'],
+    return {'to': row['to'], 'amount': round(-row['amount_cents'] / factor, get_currency_precision(currency)), 'note': row['note'],
             'time': row['time'], 'reference': row['reference']}
 
 
-def append_reset():
+def append_reset(user_id, currency):
     with closing(db_connect()) as conn:
         conn.execute('BEGIN IMMEDIATE')
-        delta = int(round((STARTING_BALANCE - ledger_balance(conn)) * 100))
-        conn.execute("INSERT INTO ledger(kind,amount_cents,created,note) VALUES('reset',?,?,?)",
-                     (delta, int(time.time()), 'Controlled demo reset'))
+        delta = int(round((STARTING_BALANCE - ledger_balance(user_id, currency, conn)) * minor_factor(currency)))
+        conn.execute("INSERT INTO ledger(kind,amount_cents,created,note,owner_id,currency) VALUES('reset',?,?,?,?,?)",
+                     (delta, int(time.time()), 'Controlled demo reset', user_id, currency))
         conn.commit()
 
 
 initialize_ledger()
-STATE = load_state()
+
+
+def country_catalog():
+    territories = Locale.parse('en').territories
+    items = []
+    today = date.today()
+    for region in phonenumbers.SUPPORTED_REGIONS:
+        dial = phonenumbers.country_code_for_region(region)
+        name = territories.get(region)
+        if not dial or not name:
+            continue
+        currencies = get_territory_currencies(region, tender=True, date=today)
+        if not currencies:
+            currencies = get_territory_currencies(region, tender=True)
+        if not currencies:
+            continue
+        items.append({'code': region, 'name': str(name), 'dial': '+' + str(dial), 'currency': currencies[0]})
+    return sorted(items, key=lambda item: item['name'].casefold())
+
+
+COUNTRIES = country_catalog()
+COUNTRY_MAP = {item['code']: item for item in COUNTRIES}
+
+
+def currency_word(currency=None):
+    code = currency or current_currency()
+    try:
+        return str(get_currency_name(code, locale='en'))
+    except Exception:
+        return code
+
+
+def parsed_phone(value, country):
+    if country not in COUNTRY_MAP:
+        return None
+    try:
+        parsed = phonenumbers.parse(str(value).strip(), country)
+    except phonenumbers.NumberParseException:
+        return None
+    if not phonenumbers.is_valid_number(parsed):
+        return None
+    region = phonenumbers.region_code_for_number(parsed)
+    if region and region != country:
+        return None
+    return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+
+
+def twilio_verify(path, values):
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_VERIFY_SERVICE_SID):
+        raise RuntimeError('Phone verification is not configured on this server.')
+    token = base64.b64encode((TWILIO_ACCOUNT_SID + ':' + TWILIO_AUTH_TOKEN).encode('utf-8')).decode('ascii')
+    url = 'https://verify.twilio.com/v2/Services/{}/{}'.format(TWILIO_VERIFY_SERVICE_SID, path)
+    req = Request(url, data=urlencode(values).encode('utf-8'), headers={
+        'Authorization': 'Basic ' + token, 'Content-Type': 'application/x-www-form-urlencoded',
+    })
+    with urlopen(req, timeout=12) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+
+def user_for_auth_token(token):
+    if not token or len(token) > 128:
+        return None
+    token_hash = hashlib.sha256(token.encode('ascii', 'ignore')).hexdigest()
+    with closing(db_connect()) as conn:
+        row = conn.execute('''SELECT users.* FROM auth_sessions JOIN users ON users.id=auth_sessions.user_id
+                              WHERE auth_sessions.token_hash=? AND auth_sessions.expires>?''',
+                           (token_hash, int(time.time()))).fetchone()
+    return dict(row) if row else None
+
+
+def user_passkeys(user_id):
+    if not user_id:
+        return []
+    with closing(db_connect()) as conn:
+        rows = conn.execute('SELECT credential_id,public_key,sign_count,rp_id FROM passkeys WHERE user_id=?',
+                            (user_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def require_user():
+    if not getattr(g, 'user_id', None):
+        return jsonify(ok=False, auth_required=True, error='Verify your phone number to continue.'), 401
+    return None
 
 
 # --------------------------------------------------------------------------
 # Small helpers
 # --------------------------------------------------------------------------
 def fmt_money(amount):
-    return '{} {:,.2f}'.format(CURRENCY, amount)
+    currency = current_currency()
+    country = getattr(g, 'country', 'GH')
+    try:
+        return format_currency(amount, currency, locale='en_' + country)
+    except Exception:
+        return '{} {:,.2f}'.format(currency, amount)
 
 
 def spoken_amount(amount):
-    return str(int(amount)) if float(amount).is_integer() else '{:.2f}'.format(amount)
+    precision = get_currency_precision(current_currency())
+    if precision == 0 or float(amount).is_integer():
+        return str(int(round(amount)))
+    return ('{:.%df}' % precision).format(amount)
 
 
 def purge_pending():
@@ -372,8 +499,9 @@ def to_amount(value):
         return None
     if not math.isfinite(amount):
         return None
-    amount = round(amount, 2)
-    if amount < 0.01 or amount > MAX_AMOUNT:
+    precision = get_currency_precision(current_currency())
+    amount = round(amount, precision)
+    if amount < 1 / (10 ** precision) or amount > MAX_AMOUNT:
         return None
     return amount
 
@@ -382,18 +510,19 @@ def challenge_for(item):
     """The WebAuthn challenge is a hash of this exact action, bound to this browser session.
     A signature made for a payment can never unlock the balance, and the other way round."""
     if item['kind'] in ('reveal', 'history'):
-        parts = ['voicepay-v3', item['kind'], item['sid'], item['nonce']]
+        parts = ['voicepay-v4', item['kind'], item['sid'], item['user_id'], item['nonce']]
     else:
-        parts = ['voicepay-v3', 'pay', item['id'], '{:.2f}'.format(item['amount']),
-                 item['recipient'], item.get('note', ''), item['nonce'], item['sid']]
+        parts = ['voicepay-v4', 'pay', item['id'], '{:.8f}'.format(item['amount']), item['currency'],
+                 item['recipient'], item.get('note', ''), item['nonce'], item['sid'], item['user_id']]
     return hashlib.sha256('|'.join(parts).encode('utf-8')).digest()
 
 
 def auth_options(item):
+    credentials = user_passkeys(g.user_id)
     options = generate_authentication_options(
         rp_id=RP_ID,
         challenge=challenge_for(item),
-        allow_credentials=[PublicKeyCredentialDescriptor(id=STATE['credential']['id'])],
+        allow_credentials=[PublicKeyCredentialDescriptor(id=row['credential_id']) for row in credentials],
         user_verification=UserVerificationRequirement.REQUIRED,
     )
     return json.loads(options_to_json(options))
@@ -473,7 +602,17 @@ def check_biometric(item, credential):
     """Return an error response, or None when the signature is valid for exactly this item."""
     if locked_out():
         return jsonify(ok=False, error='Too many failed attempts. Wait a minute and try again.'), 429
-    cred = STATE['credential']
+    try:
+        raw_id = str(credential.get('rawId') or '')
+        credential_id = base64.urlsafe_b64decode(raw_id + '=' * (-len(raw_id) % 4))
+    except Exception:
+        return jsonify(ok=False, error='Biometric check failed. Nothing was done.'), 401
+    with closing(db_connect()) as conn:
+        row = conn.execute('SELECT credential_id,public_key,sign_count,rp_id FROM passkeys '
+                           'WHERE credential_id=? AND user_id=?', (credential_id, g.user_id)).fetchone()
+    if row is None or row['rp_id'] != RP_ID:
+        return jsonify(ok=False, error='This device is not registered to this account.'), 401
+    cred = dict(row)
     try:
         verified = verify_authentication_response(
             credential=credential,
@@ -489,7 +628,9 @@ def check_biometric(item, credential):
         note_failure()
         return jsonify(ok=False, error='Biometric check failed. Nothing was done.'), 401
     FAILS.pop(g.sid, None)
-    cred['sign_count'] = verified.new_sign_count
+    with closing(db_connect()) as conn:
+        conn.execute('UPDATE passkeys SET sign_count=? WHERE credential_id=? AND user_id=?',
+                     (verified.new_sign_count, credential_id, g.user_id))
     return None
 
 
@@ -533,7 +674,7 @@ SYSTEM_PROMPT = (
     'Rules: convert number words to digits (thirty becomes 30). Treat mum, mom and mummy as Mum. '
     'If the person names someone who is not a known contact, copy the name exactly as spoken. '
     'Use null for anything that was not said. The note is the reason for the payment, for example lunch or school fees. '
-    'Amounts are in cedis unless another currency is named; never put a currency word in the amount. '
+    'The currently selected account currency is supplied in the context; never guess a different currency. '
     'If the assistant just asked for the amount and the reply is only a number, that is send_money with that amount. '
     'If it asked who to pay, a bare name is the recipient. '
     'If it asked what the payment is for, a short phrase is the note, and words like skip or nothing mean skip. '
@@ -545,7 +686,8 @@ SYSTEM_PROMPT = (
 def system_prompt(dialog):
     known = {k: dialog[k] for k in ('amount', 'recipient', 'note') if dialog and dialog.get(k) is not None}
     asked = (dialog or {}).get('awaiting') or 'nothing'
-    return SYSTEM_PROMPT + ' Details collected so far: ' + json.dumps(known) + '. The assistant just asked about: ' + asked + '.'
+    return (SYSTEM_PROMPT + ' Account currency: ' + current_currency() + ' (' + currency_word() + '). '
+            'Details collected so far: ' + json.dumps(known) + '. The assistant just asked about: ' + asked + '.')
 
 
 def extract_json(text):
@@ -642,8 +784,19 @@ def _numeric_value(text):
 def amount_mentioned(text, awaiting=None):
     """Extract money only from an amount-shaped phrase, never an unrelated note digit."""
     t = re.sub(r'(?<=\d),(?=\d{3})', '', text.lower()).strip()
-    currency = re.search(r'\b(?:cedis?|ghs|ghana cedis?)\b|₵|gh¢', t)
-    pesewa = re.search(r'(?P<num>\d{1,2}|[a-z]+(?:\s+[a-z]+)?)\s+pesewas?\b', t)
+    currency_code = current_currency()
+    code = re.escape(currency_code.lower())
+    names = {str(get_currency_name(currency_code, locale='en')).lower(),
+             str(get_currency_name(currency_code, count=2, locale='en')).lower()}
+    if currency_code == 'GHS': names.update({'cedi', 'cedis', 'ghana cedi', 'ghana cedis'})
+    if currency_code == 'USD': names.update({'dollar', 'dollars', 'buck', 'bucks'})
+    if currency_code == 'EUR': names.update({'euro', 'euros'})
+    name_pattern = '|'.join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+    symbol = re.escape(get_currency_symbol(currency_code, locale='en'))
+    currency_pattern = r'(?:\b' + code + r'\b|\b(?:' + name_pattern + r')\b|' + symbol + r')'
+    currency = re.search(currency_pattern, t)
+    pesewa = (re.search(r'(?P<num>\d{1,2}|[a-z]+(?:\s+[a-z]+)?)\s+pesewas?\b', t)
+              if currency_code == 'GHS' else None)
     pesewa_value = _numeric_value(pesewa.group('num')) if pesewa else 0
     base = None
     if currency:
@@ -658,7 +811,7 @@ def amount_mentioned(text, awaiting=None):
                 phrase = re.split(r'\b(?:for|to)\b', change.group(1), maxsplit=1)[0]
             elif not re.fullmatch(r'[\d.,\s]+|[a-z\s]+', phrase):
                 phrase = ''
-        phrase = re.sub(r'\b(?:cedis?|ghs|ghana|pesewas?)\b|₵|gh¢', ' ', phrase)
+        phrase = re.sub(currency_pattern + r'|\bpesewas?\b', ' ', phrase)
         if re.fullmatch(r"[\d.,\s]+|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
                         r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
                         r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|and|\s)+", phrase):
@@ -671,7 +824,8 @@ def amount_mentioned(text, awaiting=None):
             base = _numeric_value(phrase)
     if base is None:
         return None
-    amount = round(base + (pesewa_value / 100.0), 2)
+    precision = get_currency_precision(current_currency())
+    amount = round(base + (pesewa_value / 100.0), precision)
     return amount
 
 
@@ -803,6 +957,15 @@ def reset_dialog():
     DIALOGS.pop(g.sid, None)
 
 
+def clear_browser_flow():
+    with LOCK:
+        reset_dialog()
+        REVEALS.pop(g.sid, None)
+        HISTORY_REVEALS.pop(g.sid, None)
+        REG.pop(g.sid, None)
+        FAILS.pop(g.sid, None)
+
+
 def drop_pending():
     for key in [k for k, t in PENDING.items() if t['sid'] == g.sid]:
         del PENDING[key]
@@ -860,7 +1023,7 @@ def next_question(dialog, prefix=''):
     if dialog['amount'] is None:
         who = ' to ' + dialog['recipient'] if dialog['recipient'] else ''
         return reply(prefix + 'How much would you like to send{}?'.format(who), 'amount',
-                     [chip('GHS ' + n, n) for n in ('10', '20', '50', '100')], dialog)
+                     [chip(g.currency + ' ' + n, n) for n in ('10', '20', '50', '100')], dialog)
     if dialog['recipient'] is None:
         ask_who = 'Who should receive it?' if prefix else 'Who should get {}?'.format(fmt_money(dialog['amount']))
         return reply(prefix + ask_who, 'recipient',
@@ -880,6 +1043,8 @@ def confirm_ticket(dialog):
         'id': secrets.token_hex(16),
         'nonce': secrets.token_hex(16),
         'sid': g.sid,
+        'user_id': g.user_id,
+        'currency': g.currency,
         'amount': dialog['amount'],
         'recipient': dialog['recipient'],
         'note': dialog['note'] or '',
@@ -889,7 +1054,7 @@ def confirm_ticket(dialog):
     PENDING[txn['id']] = txn
     dialog['txn_id'], dialog['awaiting'] = txn['id'], 'confirm'
     speech = 'Send {} {} to {}{}. Tap approve and use your fingerprint or face.'.format(
-        spoken_amount(txn['amount']), CURRENCY_WORD, txn['recipient'],
+        spoken_amount(txn['amount']), currency_word(), txn['recipient'],
         (' for ' + txn['note']) if txn['note'] else '')
     return jsonify(
         kind='confirm', txn_id=txn['id'], amount_text=fmt_money(txn['amount']),
@@ -909,6 +1074,13 @@ def identify_session():
         sid = secrets.token_hex(16)
         g.set_cookie = sid
     g.sid = sid
+    g.user_id = None
+    g.country = 'GH'
+    g.currency = CURRENCY
+    g.phone = None
+    user = user_for_auth_token(request.cookies.get('vp_auth', ''))
+    if user:
+        g.user_id, g.country, g.currency, g.phone = user['id'], user['country'], user['currency'], user['phone']
 
 
 @app.errorhandler(Exception)
@@ -926,6 +1098,11 @@ def harden(response):
     if getattr(g, 'set_cookie', None):
         secure = request.is_secure
         response.set_cookie('vp_sid', g.set_cookie, httponly=True, samesite='Strict', secure=secure)
+    if getattr(g, 'auth_token_to_set', None):
+        response.set_cookie('vp_auth', g.auth_token_to_set, max_age=AUTH_SESSION_DAYS * 86400,
+                            httponly=True, samesite='Strict', secure=request.is_secure)
+    if getattr(g, 'clear_auth_cookie', False):
+        response.delete_cookie('vp_auth', httponly=True, samesite='Strict', secure=request.is_secure)
     if request.path.startswith('/api/'):
         response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -953,22 +1130,165 @@ def index():
     return send_from_directory(app.static_folder, 'index.html')
 
 
+@app.get('/api/countries')
+def api_countries():
+    return jsonify(countries=[dict(item, currency_name=currency_word(item['currency']),
+                                  currency_symbol=get_currency_symbol(item['currency'], locale='en'),
+                                  precision=get_currency_precision(item['currency'])) for item in COUNTRIES])
+
+
+@app.post('/api/auth/start')
+def api_auth_start():
+    if rate_limited('phone-start', 5, 600):
+        return too_many()
+    data = request.get_json(silent=True) or {}
+    country = str(data.get('country', '')).upper()
+    phone = parsed_phone(data.get('phone', ''), country)
+    if not phone:
+        return jsonify(ok=False, error='Enter a valid phone number for the selected country.'), 400
+    phone_key = hashlib.sha256(phone.encode('ascii')).hexdigest()
+    now = time.time()
+    with LOCK:
+        recent = [stamp for stamp in PHONE_PENDING.get(phone_key, []) if now - stamp < 3600]
+        if len(recent) >= 5:
+            PHONE_PENDING[phone_key] = recent
+            return too_many()
+        recent.append(now)
+        PHONE_PENDING[phone_key] = recent
+        if len(PHONE_PENDING) > 10000:
+            PHONE_PENDING.clear()
+            PHONE_PENDING[phone_key] = recent
+    try:
+        result = twilio_verify('Verifications', {'To': phone, 'Channel': 'sms'})
+    except (RuntimeError, HTTPError, URLError, TimeoutError, ValueError) as exc:
+        app.logger.warning('Phone verification start failed: %s', type(exc).__name__)
+        return jsonify(ok=False, error='Could not send a code. Check the number or try again later.'), 502
+    if result.get('status') not in ('pending', 'approved'):
+        return jsonify(ok=False, error='Could not start phone verification. Try again.'), 502
+    return jsonify(ok=True, phone_hint=phone[-4:])
+
+
+@app.post('/api/auth/verify')
+def api_auth_verify():
+    if rate_limited('phone-verify', 10, 600):
+        return too_many()
+    data = request.get_json(silent=True) or {}
+    country = str(data.get('country', '')).upper()
+    phone = parsed_phone(data.get('phone', ''), country)
+    code = re.sub(r'\s+', '', str(data.get('code', '')))
+    if not phone or not re.fullmatch(r'\d{4,10}', code):
+        return jsonify(ok=False, error='Enter the phone number and verification code.'), 400
+    try:
+        result = twilio_verify('VerificationCheck', {'To': phone, 'Code': code})
+    except (RuntimeError, HTTPError, URLError, TimeoutError, ValueError) as exc:
+        app.logger.warning('Phone verification check failed: %s', type(exc).__name__)
+        return jsonify(ok=False, error='Could not verify that code. Try again.'), 502
+    if result.get('status') != 'approved':
+        return jsonify(ok=False, error='That code is incorrect or expired.'), 401
+    country_info = COUNTRY_MAP[country]
+    with closing(db_connect()) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT id FROM users WHERE phone=?', (phone,)).fetchone()
+        if row:
+            user_id = row['id']
+            conn.execute('UPDATE users SET country=?,currency=? WHERE id=?',
+                         (country, country_info['currency'], user_id))
+        else:
+            user_id = str(uuid.uuid4())
+            conn.execute('INSERT INTO users(id,phone,country,currency,created) VALUES(?,?,?,?,?)',
+                         (user_id, phone, country, country_info['currency'], int(time.time())))
+        conn.commit()
+    ensure_user_ledger(user_id, country_info['currency'])
+    if g.user_id and g.user_id != user_id:
+        old_token = request.cookies.get('vp_auth', '')
+        if old_token:
+            with closing(db_connect()) as conn:
+                conn.execute('DELETE FROM auth_sessions WHERE token_hash=?',
+                             (hashlib.sha256(old_token.encode('ascii', 'ignore')).hexdigest(),))
+        clear_browser_flow()
+    auth_token = secrets.token_urlsafe(32)
+    with closing(db_connect()) as conn:
+        conn.execute('DELETE FROM auth_sessions WHERE expires<=?', (int(time.time()),))
+        conn.execute('INSERT INTO auth_sessions(token_hash,user_id,expires,created) VALUES(?,?,?,?)',
+                     (hashlib.sha256(auth_token.encode('ascii')).hexdigest(), user_id,
+                      int(time.time()) + AUTH_SESSION_DAYS * 86400, int(time.time())))
+    g.auth_token_to_set = auth_token
+    return jsonify(ok=True, authenticated=True, country=country, currency=country_info['currency'])
+
+
+@app.post('/api/auth/logout')
+def api_auth_logout():
+    token = request.cookies.get('vp_auth', '')
+    if token:
+        token_hash = hashlib.sha256(token.encode('ascii', 'ignore')).hexdigest()
+        with closing(db_connect()) as conn:
+            conn.execute('DELETE FROM auth_sessions WHERE token_hash=?', (token_hash,))
+    clear_browser_flow()
+    g.clear_auth_cookie = True
+    return jsonify(ok=True)
+
+
+@app.post('/api/transcribe')
+def api_transcribe():
+    if rate_limited('transcribe', 10, 300):
+        return too_many()
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
+    if client is None:
+        return jsonify(ok=False, error='Voice transcription needs the server speech service. You can type instead.'), 503
+    audio = request.files.get('audio')
+    if audio is None or not audio.filename:
+        return jsonify(ok=False, error='No audio was received. Try recording again.'), 400
+    mime = (audio.mimetype or '').lower().split(';', 1)[0].strip()
+    if mime == 'audio/x-wav':
+        mime = 'audio/wav'
+    allowed = {'audio/webm', 'audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/x-wav'}
+    if mime not in allowed:
+        return jsonify(ok=False, error='This browser audio format is not supported. Type your message instead.'), 415
+    language = str(request.form.get('language', 'en')).split('-')[0].lower()
+    if not re.fullmatch(r'[a-z]{2,3}', language):
+        language = 'en'
+    try:
+        audio.stream.seek(0, os.SEEK_END)
+        size = audio.stream.tell()
+        audio.stream.seek(0)
+        if size > 7 * 1024 * 1024:
+            return jsonify(ok=False, error='That recording is too long. Try a shorter phrase.'), 413
+        result = client.audio.transcriptions.create(
+            file=('recording.' + mime.split('/')[-1], audio.stream, mime), model=AUDIO_MODEL, language=language,
+            response_format='json', temperature=0,
+        )
+    except Exception as exc:
+        app.logger.warning('Audio transcription failed: %s', type(exc).__name__)
+        return jsonify(ok=False, error='Could not understand that recording. Try again or type instead.'), 502
+    transcript = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', str(getattr(result, 'text', '') or '')).strip()[:300]
+    if not transcript:
+        return jsonify(ok=False, error='No speech was detected. Try again or type instead.'), 422
+    return jsonify(ok=True, text=transcript)
+
+
 @app.get('/api/state')
 def api_state():
     """Everything the page needs to draw itself. The balance is deliberately not in here."""
     with LOCK:
         purge_pending()
-        return jsonify(
-            currency=CURRENCY,
-            registered=STATE['credential'] is not None,
-            reset_enabled=ALLOW_RESET,
-            contacts=CONTACTS,
-            ai=client is not None,
-        )
+        user_passkey_count = len(user_passkeys(g.user_id)) if g.user_id else 0
+        country = COUNTRY_MAP.get(g.country, {})
+        return jsonify(authenticated=bool(g.user_id), currency=g.currency, country=g.country,
+                       country_name=country.get('name'), registered=user_passkey_count > 0,
+                       passkey_count=user_passkey_count, reset_enabled=ALLOW_RESET,
+                       contacts=CONTACTS, ai=client is not None,
+                       phone_hint=(g.phone[-4:] if g.phone else None),
+                       account_identity=(hashlib.sha256(g.user_id.encode('ascii')).hexdigest()[:16]
+                                         if g.user_id else None))
 
 
 @app.post('/api/chat')
 def api_chat():
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
     # Keep each browser's conversation turns in order, including time spent parsing speech.
     with session_lock(g.sid):
         return _api_chat()
@@ -1030,7 +1350,7 @@ def _api_chat():
                          contact_chips if problem[1] == 'recipient' else None, dialog,
                          source=source)
 
-        if STATE['credential'] is None:
+        if not user_passkeys(g.user_id):
             return message('Your payment details are saved. Set up Face ID / Touch ID to continue.',
                            needs_setup=True, source=source, expects=None, chips=[])
 
@@ -1046,10 +1366,13 @@ def _api_chat():
 
 @app.post('/api/resume')
 def api_resume():
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
     with session_lock(g.sid):
         with LOCK:
-            if STATE['credential'] is None:
-                return jsonify(ok=False, error='Set up Face ID / Touch ID first.'), 400
+            if not user_passkeys(g.user_id):
+                return jsonify(ok=False, error='Set up device approval first.'), 400
             return next_question(get_dialog())
 
 
@@ -1068,6 +1391,8 @@ def api_health_details():
         return jsonify(error='Owner authentication required.'), 401
     if rate_limited('health-details', 5):
         return too_many()
+    with closing(db_connect()) as conn:
+        registered_users = conn.execute('SELECT COUNT(DISTINCT user_id) FROM passkeys').fetchone()[0]
     info = {
         'rp_id': RP_ID,
         'origins': ORIGINS,
@@ -1075,7 +1400,7 @@ def api_health_details():
         'domain_problem': domain_warning(),
         'groq_key_set': client is not None,
         'models': MODELS,
-        'biometric_registered': STATE['credential'] is not None,
+        'registered_users': registered_users,
     }
     if request.args.get('live') == '1':
         if client is None:
@@ -1092,24 +1417,24 @@ def api_health_details():
 def api_register_options():
     if rate_limited('register-options', 8):
         return too_many()
-    data = request.get_json(silent=True) or {}
-    if not valid_setup_token(data.get('setup_token')):
-        return jsonify(error='Device setup requires the owner setup token.'), 403
-    if STATE['credential'] is not None and not ALLOW_REREGISTER:
-        return jsonify(error='A device is already registered. Set ALLOW_REREGISTER=1 to replace it.'), 409
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
+    existing = user_passkeys(g.user_id)
     options = generate_registration_options(
         rp_id=RP_ID,
         rp_name=RP_NAME,
-        user_id=USER_ID,
-        user_name=USER_NAME,
-        user_display_name='VoicePay demo',
+        user_id=uuid.UUID(g.user_id).bytes,
+        user_name='voicepay-' + g.user_id[:8],
+        user_display_name='VoicePay ••' + g.phone[-4:],
+        exclude_credentials=[PublicKeyCredentialDescriptor(id=row['credential_id']) for row in existing],
         authenticator_selection=AuthenticatorSelectionCriteria(
             authenticator_attachment=AuthenticatorAttachment.PLATFORM,
             user_verification=UserVerificationRequirement.REQUIRED,
         ),
     )
     with LOCK:
-        REG[g.sid] = {'challenge': options.challenge, 'created': time.time()}
+        REG[g.sid] = {'challenge': options.challenge, 'created': time.time(), 'user_id': g.user_id}
     return json_response(options_to_json(options))
 
 
@@ -1118,14 +1443,15 @@ def api_register_verify():
     credential = request.get_json(silent=True)
     if rate_limited('register-verify', 8):
         return too_many()
-    if not isinstance(credential, dict) or not valid_setup_token(credential.get('setup_token')):
-        return jsonify(ok=False, error='Device setup requires the owner setup token.'), 403
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
+    if not isinstance(credential, dict) or not isinstance(credential.get('credential'), dict):
+        return jsonify(ok=False, error='The device response was missing.'), 400
     with LOCK:
-        if STATE['credential'] is not None and not ALLOW_REREGISTER:
-            # Without this, anyone who opens the site could register their own face and approve payments.
-            return jsonify(ok=False, error='A device is already registered.'), 409
         registration = REG.get(g.sid)
-        if registration is None or time.time() - registration['created'] > PENDING_TTL:
+        if (registration is None or registration['user_id'] != g.user_id
+                or time.time() - registration['created'] > PENDING_TTL):
             REG.pop(g.sid, None)
             return jsonify(ok=False, error='Registration expired. Reload the page and try again.'), 400
         try:
@@ -1140,13 +1466,10 @@ def api_register_verify():
             app.logger.warning('Registration failed: %s', exc)
             return jsonify(ok=False, error='Could not register this device. Check RP_ID and ORIGIN settings.'), 400
         REG.pop(g.sid, None)
-        STATE['credential'] = {
-            'id': verified.credential_id,
-            'public_key': verified.credential_public_key,
-            'sign_count': verified.sign_count,
-            'rp_id': RP_ID,
-        }
-        save_state()
+        with closing(db_connect()) as conn:
+            conn.execute('INSERT OR REPLACE INTO passkeys(credential_id,user_id,public_key,sign_count,rp_id,created) '
+                         'VALUES(?,?,?,?,?,?)', (verified.credential_id, g.user_id, verified.credential_public_key,
+                                                 verified.sign_count, RP_ID, int(time.time())))
     return jsonify(ok=True)
 
 
@@ -1157,55 +1480,61 @@ def api_approve():
     data = request.get_json(silent=True) or {}
     txn_id = str(data.get('txn_id', ''))
     credential = data.get('credential')
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
+    factor = minor_factor(g.currency)
 
     with LOCK:
         purge_pending()
-        prior = ledger_payment(txn_id, g.sid) if txn_id else None
+        prior = ledger_payment(txn_id, g.sid, g.user_id, g.currency) if txn_id else None
         if prior is not None:
             return jsonify(ok=True, record=prior, replayed=True)
         if not isinstance(credential, dict):
             return jsonify(ok=False, error='The biometric response was missing.'), 400
         txn = PENDING.get(txn_id)
-        if txn is None or txn['sid'] != g.sid:
+        if txn is None or txn['sid'] != g.sid or txn.get('user_id') != g.user_id:
             return jsonify(ok=False, expired=True, error='This payment expired or was already used. Please start again.'), 410
-        if STATE['credential'] is None:
-            return jsonify(ok=False, error='Set up Face ID / Touch ID first.'), 400
+        if not user_passkeys(g.user_id):
+            return jsonify(ok=False, error='Set up device approval first.'), 400
 
         failure = check_biometric(txn, credential)
         if failure:
             return failure
-        save_state()
         conn = db_connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
-            already = conn.execute("SELECT id FROM ledger WHERE idempotency_key=? AND session_id=?",
-                                   (txn_id, g.sid)).fetchone()
+            already = conn.execute("SELECT id FROM ledger WHERE idempotency_key=? AND session_id=? AND owner_id=?",
+                                   (txn_id, g.sid, g.user_id)).fetchone()
             if already:
                 conn.commit()
-                return jsonify(ok=True, record=ledger_payment(txn_id, g.sid), replayed=True)
-            balance_cents = conn.execute('SELECT COALESCE(SUM(amount_cents),0) FROM ledger').fetchone()[0]
+                return jsonify(ok=True, record=ledger_payment(txn_id, g.sid, g.user_id, g.currency), replayed=True)
+            balance_cents = conn.execute('SELECT COALESCE(SUM(amount_cents),0) FROM ledger '
+                                         'WHERE owner_id=? AND currency=?', (g.user_id, g.currency)).fetchone()[0]
             since = int(time.time() - 86400)
             spent_cents = conn.execute("SELECT COALESCE(SUM(-amount_cents),0) FROM ledger "
-                                       "WHERE kind='payment' AND created>?", (since,)).fetchone()[0]
-            amount_cents = int(round(txn['amount'] * 100))
+                                       "WHERE kind='payment' AND owner_id=? AND currency=? AND created>?",
+                                       (g.user_id, g.currency, since)).fetchone()[0]
+            amount_cents = int(round(txn['amount'] * factor))
             if amount_cents > balance_cents:
                 conn.rollback()
                 del PENDING[txn_id]
                 reset_dialog()
                 return jsonify(ok=False, expired=True, error='Insufficient funds. The payment was not sent.'), 400
-            if amount_cents > int(round(DAILY_LIMIT * 100)) - spent_cents:
+            if amount_cents > int(round(DAILY_LIMIT * factor)) - spent_cents:
                 conn.rollback()
                 del PENDING[txn_id]
                 reset_dialog()
                 return jsonify(ok=False, expired=True, error='The payment could not be approved under today’s limits.'), 400
             created = int(time.time())
-            conn.execute('''INSERT INTO ledger(kind,amount_cents,recipient,note,created,idempotency_key,session_id)
-                            VALUES('payment',?,?,?,?,?,?)''',
-                         (-amount_cents, txn['recipient'], txn['note'], created, txn_id, g.sid))
+            conn.execute('''INSERT INTO ledger(kind,amount_cents,recipient,note,created,idempotency_key,session_id,owner_id,currency)
+                            VALUES('payment',?,?,?,?,?,?,?,?)''',
+                         (-amount_cents, txn['recipient'], txn['note'], created, txn_id, g.sid,
+                          g.user_id, g.currency))
             conn.commit()
         except sqlite3.IntegrityError:
             conn.rollback()
-            prior = ledger_payment(txn_id, g.sid)
+            prior = ledger_payment(txn_id, g.sid, g.user_id, g.currency)
             if prior is not None:
                 del PENDING[txn_id]
                 return jsonify(ok=True, record=prior, replayed=True)
@@ -1225,11 +1554,15 @@ def api_balance_options():
     """Step 1 of showing the balance: get a one-time challenge for Face ID / Touch ID."""
     if rate_limited('reveal-options', 20):
         return too_many()
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
     with LOCK:
         purge_pending()
-        if STATE['credential'] is None:
-            return jsonify(ok=False, error='Set up Face ID / Touch ID first.'), 400
-        item = {'kind': 'reveal', 'nonce': secrets.token_hex(16), 'sid': g.sid, 'created': time.time()}
+        if not user_passkeys(g.user_id):
+            return jsonify(ok=False, error='Set up device approval first.'), 400
+        item = {'kind': 'reveal', 'nonce': secrets.token_hex(16), 'sid': g.sid,
+                'user_id': g.user_id, 'created': time.time()}
         REVEALS[g.sid] = item
         return jsonify(ok=True, options=auth_options(item), expires_in=PENDING_TTL)
 
@@ -1239,6 +1572,9 @@ def api_balance_reveal():
     """Step 2: the only place the balance ever leaves the server. Needs a fresh biometric signature."""
     if rate_limited('reveal', 20):
         return too_many()
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
     data = request.get_json(silent=True) or {}
     credential = data.get('credential')
     if not isinstance(credential, dict):
@@ -1246,14 +1582,13 @@ def api_balance_reveal():
     with LOCK:
         purge_pending()
         item = REVEALS.get(g.sid)
-        if item is None or STATE['credential'] is None:
+        if item is None or item.get('user_id') != g.user_id or not user_passkeys(g.user_id):
             return jsonify(ok=False, expired=True, error='That unlock expired. Tap Show balance again.'), 410
         failure = check_biometric(item, credential)
         if failure:
             return failure
         del REVEALS[g.sid]  # one signature shows the balance once
-        save_state()
-        balance = ledger_balance()
+        balance = ledger_balance(g.user_id, g.currency)
     return jsonify(ok=True, balance_text=fmt_money(balance), show_seconds=REVEAL_SECONDS)
 
 
@@ -1261,11 +1596,15 @@ def api_balance_reveal():
 def api_history_options():
     if rate_limited('history-options', 20):
         return too_many()
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
     with LOCK:
         purge_pending()
-        if STATE['credential'] is None:
-            return jsonify(ok=False, error='Set up Face ID / Touch ID first.'), 400
-        item = {'kind': 'history', 'nonce': secrets.token_hex(16), 'sid': g.sid, 'created': time.time()}
+        if not user_passkeys(g.user_id):
+            return jsonify(ok=False, error='Set up device approval first.'), 400
+        item = {'kind': 'history', 'nonce': secrets.token_hex(16), 'sid': g.sid,
+                'user_id': g.user_id, 'created': time.time()}
         HISTORY_REVEALS[g.sid] = item
         return jsonify(ok=True, options=auth_options(item), expires_in=PENDING_TTL)
 
@@ -1274,6 +1613,9 @@ def api_history_options():
 def api_history_reveal():
     if rate_limited('history-reveal', 20):
         return too_many()
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
     data = request.get_json(silent=True) or {}
     credential = data.get('credential')
     if not isinstance(credential, dict):
@@ -1281,19 +1623,21 @@ def api_history_reveal():
     with LOCK:
         purge_pending()
         item = HISTORY_REVEALS.get(g.sid)
-        if item is None or STATE['credential'] is None:
+        if item is None or item.get('user_id') != g.user_id or not user_passkeys(g.user_id):
             return jsonify(ok=False, expired=True, error='That unlock expired. Tap Show payments again.'), 410
         failure = check_biometric(item, credential)
         if failure:
             return failure
         del HISTORY_REVEALS[g.sid]
-        save_state()
-        history = ledger_history(8)
+        history = ledger_history(g.user_id, g.currency, 8)
     return jsonify(ok=True, history=history, show_seconds=REVEAL_SECONDS)
 
 
 @app.post('/api/cancel')
 def api_cancel():
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
     with LOCK:
         reset_dialog()
     return jsonify(ok=True)
@@ -1304,8 +1648,11 @@ def api_reset():
     """Append a demo reset adjustment while preserving the payment audit ledger."""
     if not ALLOW_RESET:
         return jsonify(error='Reset is turned off on this server.'), 403
+    auth_error = require_user()
+    if auth_error:
+        return auth_error
     with LOCK:
-        append_reset()
+        append_reset(g.user_id, g.currency)
         PENDING.clear()
         REVEALS.clear()
         HISTORY_REVEALS.clear()

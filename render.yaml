@@ -17,6 +17,12 @@ services:
         sync: false
       - key: SETUP_TOKEN
         sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_VERIFY_SERVICE_SID
+        sync: false
       - key: ALLOW_RESET
         value: "0"
       - key: PROXY_FIX_HOPS

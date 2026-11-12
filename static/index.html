@@ -24,6 +24,7 @@
       <button class="nav-item" type="button" data-view="balance"><span>◈</span>Balance</button>
       <button class="nav-item" type="button" data-view="history"><span>◷</span>Activity</button>
       <button class="nav-item" type="button" data-view="setup"><span>⌑</span>Secure</button>
+      <button class="nav-item" type="button" data-view="account"><span>◎</span>Account</button>
     </nav>
 
     <section class="screen active" id="screen-home" data-screen="home" aria-labelledby="home-title">
@@ -47,7 +48,7 @@
       <div class="steps-grid">
         <article class="step-card"><span>01</span><div class="step-icon">◉</div><h2>Say it</h2><p>Speak or type an amount and a contact.</p></article>
         <article class="step-card"><span>02</span><div class="step-icon">◇</div><h2>Review it</h2><p>Check the recipient and amount before you continue.</p></article>
-        <article class="step-card"><span>03</span><div class="step-icon">⌑</div><h2>Approve it</h2><p>Use your device’s Face ID, Touch ID, or passkey.</p></article>
+        <article class="step-card"><span>03</span><div class="step-icon">⌑</div><h2>Approve it</h2><p>Confirm with your phone or computer’s built-in security.</p></article>
       </div>
       <div class="about-note">This is a demo. Its balance and payment history are simulated.</div>
       <button class="gold-button" type="button" data-view="pay">Try the demo <span>→</span></button>
@@ -89,7 +90,7 @@
 
     <section class="screen" id="screen-balance" data-screen="balance" aria-labelledby="balance-title" hidden>
       <div class="subpage-heading centered"><p class="eyebrow">PRIVATE VIEW</p><h1 id="balance-title">Your balance</h1><p class="short-copy">Only shown after device verification.</p></div>
-      <div class="balance-card"><span class="card-topline">AVAILABLE · SIMULATED</span><p id="balance" class="balance-value masked" aria-label="Balance hidden">••••••</p><button id="reveal" class="gold-button" type="button">Unlock with Face ID</button><p id="reveal-note" class="balance-note">Protected by your passkey</p></div>
+      <div class="balance-card"><span id="balance-caption" class="card-topline">AVAILABLE · SIMULATED</span><p id="balance" class="balance-value masked" aria-label="Balance hidden">••••••</p><button id="reveal" class="gold-button" type="button">Unlock with biometrics</button><p id="reveal-note" class="balance-note">Protected by device security</p></div>
     </section>
 
     <section class="screen" id="screen-history" data-screen="history" aria-labelledby="history-title" hidden>
@@ -99,22 +100,43 @@
     </section>
 
     <section class="screen" id="screen-setup" data-screen="setup" aria-labelledby="setup-title" hidden>
-      <div class="subpage-heading centered"><p class="eyebrow">DEVICE SECURITY</p><h1 id="setup-title">Your approval key</h1><p class="short-copy">Register this device to approve payments and unlock private screens.</p></div>
+      <div class="subpage-heading centered"><p class="eyebrow">DEVICE SECURITY</p><h1 id="setup-title">Device approval</h1><p class="short-copy">Register this device to approve payments and unlock private screens.</p></div>
       <div id="setup-box" class="setup-card">
-        <div class="setup-step"><span>1</span><div><h2>Owner token</h2><p id="setup-text">Enter the setup token provided by the demo owner.</p></div></div>
-        <label class="sr-only" for="setup-token">Owner setup token</label><input id="setup-token" type="password" autocomplete="off" spellcheck="false" placeholder="Enter setup token">
+        <div class="setup-step"><span>1</span><div><h2>Prepare device</h2><p>Use this phone or computer’s built-in security.</p></div></div>
         <button id="setup-prepare" class="outline-button" type="button">Prepare device</button>
-        <div class="setup-step second-step"><span>2</span><div><h2>Biometric check</h2><p>Use Face ID, Touch ID, or your device passkey.</p></div></div>
-        <button id="setup-scan" class="gold-button" type="button" hidden>Scan to register</button>
+        <div class="setup-step second-step"><span>2</span><div><h2>Confirm it’s you</h2><p>Your device may ask for Face ID, Touch ID, or screen lock.</p></div></div>
+        <button id="setup-scan" class="gold-button" type="button" hidden>Confirm on this device</button>
       </div>
-      <p id="setup-complete" class="setup-complete" hidden><span>✓</span> This device is ready for approval.</p>
+      <div id="setup-complete" class="setup-complete" hidden><span>✓</span> Device approval is ready.<button id="add-device" class="text-link" type="button">Add this device</button></div>
       <p class="screen-footnote">Your biometric data stays on your device.</p>
+    </section>
+
+    <section class="screen" id="screen-account" data-screen="account" aria-labelledby="account-title" hidden>
+      <div class="subpage-heading centered"><p class="eyebrow">PHONE VERIFICATION</p><h1 id="account-title">Your account</h1><p class="short-copy">Verify your number to create or access your account.</p></div>
+      <div class="setup-card account-card">
+        <div id="account-form">
+          <label class="field-label" for="country-select">Country</label>
+          <select id="country-select" class="country-select"><option value="GH">Loading countries…</option></select>
+          <p id="currency-preview" class="currency-preview">Currency · GHS</p>
+          <label class="field-label" for="phone-number">Phone number</label>
+          <input id="phone-number" type="tel" inputmode="tel" autocomplete="tel" placeholder="Phone number">
+          <button id="send-code" class="gold-button" type="button">Send code</button>
+          <div id="code-group" hidden>
+            <label class="field-label" for="phone-code">Verification code</label>
+            <input id="phone-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="Enter SMS code">
+            <button id="verify-code" class="outline-button" type="button">Verify number</button>
+          </div>
+          <p class="screen-footnote">SMS charges and country delivery rules may apply.</p>
+        </div>
+      </div>
+      <div id="account-ready" class="setup-complete" hidden><span>✓</span> Phone verified · <b id="account-currency"></b><button id="logout" class="text-link" type="button">Sign out</button></div>
     </section>
 
     <section class="screen" id="screen-settings" data-screen="settings" aria-labelledby="settings-title" hidden>
       <div class="screen-heading"><div><p class="eyebrow">PREFERENCES</p><h1 id="settings-title">Settings</h1></div><button class="tiny-action" type="button" data-view="home" aria-label="Back home">×</button></div>
       <div class="settings-panel"><div class="setting-row"><span>Voice replies</span><button id="sound-setting" class="toggle" type="button" aria-pressed="false" aria-label="Toggle voice replies"><i></i></button></div><label class="setting-row" for="language"><span>Speech language</span><select id="language"><option value="en-GH">English · Ghana</option><option value="en-GB">English · UK</option><option value="en-US">English · US</option></select></label><p class="screen-footnote">The microphone is always optional.</p></div>
       <button id="reset" class="text-link reset-link" type="button">Reset demo</button>
+      <button id="logout-settings" class="text-link reset-link" type="button">Sign out</button>
     </section>
 
     <footer class="app-footer"><span id="status" class="status" role="status" aria-live="polite"></span><button class="footer-settings" type="button" data-view="settings">Settings <span>⚙</span></button><span id="engine" class="engine sr-only"></span></footer>

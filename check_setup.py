@@ -28,7 +28,7 @@ if sys.version_info < (3, 9):
     bad('Python 3.9 or newer is required.')
 
 print('\nLibraries')
-for package in ('flask', 'openai', 'webauthn'):
+for package in ('flask', 'openai', 'webauthn', 'Babel', 'phonenumbers'):
     try:
         ok('{} {}'.format(package, metadata.version(package)))
     except metadata.PackageNotFoundError:
@@ -132,10 +132,15 @@ except Exception as exc:
     voicepay = None
 
 if voicepay is not None:
-    if voicepay.SETUP_TOKEN:
-        ok('SETUP_TOKEN is set (required for device registration)')
+    twilio = (voicepay.TWILIO_ACCOUNT_SID, voicepay.TWILIO_AUTH_TOKEN, voicepay.TWILIO_VERIFY_SERVICE_SID)
+    if all(twilio):
+        ok('Twilio Verify is configured for phone sign-in')
     else:
-        bad('SETUP_TOKEN is not set. Create a long random secret in .env before registering a device.')
+        bad('Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_VERIFY_SERVICE_SID before phone sign-in.')
+    if voicepay.SETUP_TOKEN:
+        ok('SETUP_TOKEN is set for owner-only diagnostics')
+    else:
+        print('  [skip] SETUP_TOKEN is not set; owner diagnostics will be unavailable.')
     if voicepay.ALLOW_RESET:
         ok('ALLOW_RESET is enabled (use only for a controlled demo)')
     else:

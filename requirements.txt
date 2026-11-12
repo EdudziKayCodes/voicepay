@@ -4,3 +4,5 @@ webauthn==2.7.1
 python-dotenv==1.2.4
 redis==8.1.0
 gunicorn==27.0.0
+Babel==2.18.0
+phonenumbers==9.0.40
