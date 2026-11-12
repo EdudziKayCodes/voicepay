@@ -58,6 +58,7 @@
       <div class="screen-heading"><div><p class="eyebrow">PAYMENT</p><h1 id="pay-title">Send money</h1></div><button class="tiny-action" type="button" data-view="setup" aria-label="Security setup">⌑</button></div>
       <div class="pay-layout">
         <div class="conversation-panel">
+      <div class="transfer-options"><label for="recipient-country">Destination</label><select id="recipient-country" aria-label="Destination country"><option value="">Same as my country</option></select><button id="pick-contact" class="text-link" type="button">Choose a contact</button></div>
       <div class="contact-shortcuts" id="chips"></div>
           <ol id="log" class="log" aria-live="polite"></ol>
           <div class="compose-wrap">
@@ -73,7 +74,7 @@
           <div class="aside-card" id="ticket" role="region" aria-labelledby="ticket-title" hidden>
             <div class="card-topline"><span id="ticket-title">REVIEW PAYMENT</span><span class="lock-dot">⌑</span></div>
             <h2 id="t-amount" class="ticket-amount"></h2>
-            <p id="t-to" class="ticket-to"></p><p id="t-note" class="ticket-note"></p><p id="t-change" class="ticket-change" hidden></p>
+            <p id="t-to" class="ticket-to"></p><p id="t-route" class="ticket-note" hidden></p><p id="t-note" class="ticket-note"></p><p id="t-change" class="ticket-change" hidden></p>
             <div class="ticket-divider"></div>
             <p class="ticket-safe">Check these details before approving.</p>
             <div class="ticket-actions"><button id="approve" class="gold-button" type="button">Approve with biometrics</button><button id="cancel" class="outline-button" type="button">Cancel</button></div>
@@ -96,7 +97,7 @@
     <section class="screen" id="screen-history" data-screen="history" aria-labelledby="history-title" hidden>
       <div class="screen-heading"><div><p class="eyebrow">PRIVATE VIEW</p><h1 id="history-title">Activity</h1></div><button id="history-reveal" class="gold-button history-toggle" type="button">Unlock activity</button></div>
       <div class="history-panel"><div class="history-lock"><span>⌑</span><p>Unlock to see your recent payments.</p></div><ul id="history" class="history" hidden></ul><p id="empty" class="empty-history" hidden>No payments yet.</p></div>
-      <p id="shared-history-note" class="screen-footnote">Demo activity is shared across visitors.</p>
+      <p id="shared-history-note" class="screen-footnote">Each phone account has a separate demo activity list.</p>
     </section>
 
     <section class="screen" id="screen-setup" data-screen="setup" aria-labelledby="setup-title" hidden>
@@ -116,8 +117,8 @@
       <div class="setup-card account-card">
         <div id="account-form">
           <label class="field-label" for="country-select">Country</label>
-          <select id="country-select" class="country-select"><option value="GH">Loading countries…</option></select>
-          <p id="currency-preview" class="currency-preview">Currency · GHS</p>
+          <select id="country-select" class="country-select"><option value="IN">Loading countries…</option></select>
+          <p id="currency-preview" class="currency-preview">Currency · INR</p>
           <label class="field-label" for="phone-number">Phone number</label>
           <input id="phone-number" type="tel" inputmode="tel" autocomplete="tel" placeholder="Phone number">
           <button id="send-code" class="gold-button" type="button">Send code</button>
@@ -126,7 +127,7 @@
             <input id="phone-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="Enter SMS code">
             <button id="verify-code" class="outline-button" type="button">Verify number</button>
           </div>
-          <p class="screen-footnote">SMS charges and country delivery rules may apply.</p>
+          <p class="screen-footnote">Firebase sends the verification code. Carrier charges may apply.</p>
         </div>
       </div>
       <div id="account-ready" class="setup-complete" hidden><span>✓</span> Phone verified · <b id="account-currency"></b><button id="logout" class="text-link" type="button">Sign out</button></div>
@@ -134,7 +135,7 @@
 
     <section class="screen" id="screen-settings" data-screen="settings" aria-labelledby="settings-title" hidden>
       <div class="screen-heading"><div><p class="eyebrow">PREFERENCES</p><h1 id="settings-title">Settings</h1></div><button class="tiny-action" type="button" data-view="home" aria-label="Back home">×</button></div>
-      <div class="settings-panel"><div class="setting-row"><span>Voice replies</span><button id="sound-setting" class="toggle" type="button" aria-pressed="false" aria-label="Toggle voice replies"><i></i></button></div><label class="setting-row" for="language"><span>Speech language</span><select id="language"><option value="en-GH">English · Ghana</option><option value="en-GB">English · UK</option><option value="en-US">English · US</option></select></label><p class="screen-footnote">The microphone is always optional.</p></div>
+      <div class="settings-panel"><div class="setting-row"><span>Voice replies</span><button id="sound-setting" class="toggle" type="button" aria-pressed="false" aria-label="Toggle voice replies"><i></i></button></div><label class="setting-row" for="language"><span>Speech language</span><select id="language"><option value="en-IN">English · India</option><option value="en-US">English · US</option><option value="en-GB">English · UK</option></select></label><p class="screen-footnote">The microphone is always optional.</p></div>
       <button id="reset" class="text-link reset-link" type="button">Reset demo</button>
       <button id="logout-settings" class="text-link reset-link" type="button">Sign out</button>
     </section>

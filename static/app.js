@@ -8,12 +8,18 @@
 const $ = (id) => document.getElementById(id);
 const HIDDEN_BALANCE = '\u2022\u2022\u2022\u2022\u2022\u2022';
 
-let LANG = 'en-GH';
+let LANG = 'en-IN';
 let countryCatalog = [];
+let firebaseAuth = null;
+let firebaseModules = null;
+let firebaseConfirmation = null;
+let firebaseRecaptcha = null;
+let firebaseSyncUid = null;
+let firebaseVerificationInProgress = false;
 
 const app = {
-  currency: 'GHS',
-  country: 'GH',
+  currency: 'INR',
+  country: 'IN',
   authenticated: false,
   accountIdentity: null,
   registered: false,
@@ -44,6 +50,7 @@ const app = {
   sound: false, // voice mode is opt-in
   lastPayment: null,
   recentContacts: [],
+  selectedContact: null,
 };
 
 /* ---------- helpers ---------- */
@@ -98,6 +105,43 @@ async function apiUpload(path, form) {
   return data;
 }
 
+async function initializeFirebase() {
+  if (firebaseAuth && firebaseModules) return firebaseModules;
+  const response = await api('/api/firebase/config');
+  if (!response.configured || !response.config) throw new Error('Phone sign-in is not configured yet.');
+  const root = 'https://www.gstatic.com/firebasejs/13.2.0/';
+  const [appSdk, authSdk] = await Promise.all([
+    import(root + 'firebase-app.js'), import(root + 'firebase-auth.js'),
+  ]);
+  const firebaseApp = appSdk.initializeApp(response.config);
+  firebaseAuth = authSdk.getAuth(firebaseApp);
+  firebaseAuth.languageCode = LANG;
+  firebaseModules = authSdk;
+  authSdk.onAuthStateChanged(firebaseAuth, async (user) => {
+    if (!user || firebaseVerificationInProgress || firebaseSyncUid === user.uid || app.authenticated) return;
+    firebaseSyncUid = user.uid;
+    try {
+      await api('/api/auth/firebase', { id_token: await user.getIdToken() });
+      await refresh();
+      navigate(app.registered ? 'home' : 'setup');
+      say(app.registered ? 'Signed in.' : 'Verified. Add device approval to continue.', 'ok');
+    } catch (e) { firebaseSyncUid = null; say(e.message, 'error'); }
+  });
+  return firebaseModules;
+}
+
+function phoneToE164(value, country) {
+  const raw = String(value || '').trim();
+  if (raw.startsWith('+')) return '+' + raw.slice(1).replace(/\D/g, '');
+  const dial = countryCatalog.find((item) => item.code === country)?.dial;
+  if (!dial) throw new Error('Select a country first.');
+  let digits = raw.replace(/\D/g, '');
+  const countryDigits = dial.slice(1);
+  if (digits.startsWith(countryDigits)) return '+' + digits;
+  digits = digits.replace(/^0+/, '');
+  return dial + digits;
+}
+
 function formatMoney(value) {
   try { return new Intl.NumberFormat('en-' + app.country, { style: 'currency', currency: app.currency }).format(Number(value)); }
   catch (e) { return app.currency + ' ' + Number(value).toLocaleString(); }
@@ -144,6 +188,7 @@ function clearClientFlow() {
   app.txn = null;
   app.lastPayment = null;
   app.recentContacts = [];
+  app.selectedContact = null;
   app.revealOptions = null;
   app.historyOptions = null;
   $('log').textContent = '';
@@ -225,12 +270,17 @@ async function botSay(text, expects, isError) {
 async function handleCommand(text, shown) {
   text = (text || '').trim();
   if (!text || app.busy) return;
+  if (/\b(cancel|stop|abort|never\s?mind)\b/i.test(text)) app.selectedContact = null;
   app.busy = true;
   addMessage('you', shown || text);
   setChips([]);
   say('');
   try {
-    const r = await api('/api/chat', { text });
+    const r = await api('/api/chat', {
+      text,
+      recipient_country: $('recipient-country').value || app.country,
+      recipient_phone: app.selectedContact ? app.selectedContact.phone : '',
+    });
     navigate('pay');
     if (r.source) $('engine').textContent = r.source === 'ai' ? 'Enhanced command understanding' : 'Basic command understanding';
     if (r.kind === 'confirm') {
@@ -273,7 +323,9 @@ function renderHistory(items) {
     const sub = document.createElement('span');
     sub.className = 'sub';
     const when = new Date(h.time * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
-    sub.textContent = (h.note ? h.note + ', ' : '') + when + (h.reference ? ' · Ref ' + h.reference : '');
+    const destination = h.recipient_country && h.recipient_country !== app.country
+      ? ' | Demo route: ' + h.recipient_country + ' (' + h.currency + ' to ' + h.recipient_currency + ')' : '';
+    sub.textContent = (h.note ? h.note + ', ' : '') + when + destination + (h.reference ? ' · Ref ' + h.reference : '');
     li.append(who, sum, sub);
     list.appendChild(li);
   });
@@ -284,7 +336,8 @@ async function refresh() {
   const s = await api('/api/state');
   if (app.accountIdentity && s.authenticated && s.account_identity !== app.accountIdentity) clearClientFlow();
   app.currency = s.currency;
-  app.country = s.country || 'GH';
+  app.country = s.country || 'IN';
+  if ($('country-select') && s.authenticated) $('country-select').value = app.country;
   app.authenticated = Boolean(s.authenticated);
   if (s.authenticated) app.accountIdentity = s.account_identity;
   app.registered = s.registered;
@@ -316,7 +369,13 @@ async function loadCountryOptions() {
     const data = await response.json();
     countryCatalog = data.countries || [];
     const select = $('country-select');
+    const destination = $('recipient-country');
     select.textContent = '';
+    destination.textContent = '';
+    const same = document.createElement('option');
+    same.value = '';
+    same.textContent = 'Same as my country';
+    destination.appendChild(same);
     countryCatalog.forEach((item) => {
       const option = document.createElement('option');
       option.value = item.code;
@@ -324,8 +383,11 @@ async function loadCountryOptions() {
       option.dataset.currency = item.currency;
       option.dataset.currencyName = item.currency_name;
       select.appendChild(option);
+      const routeOption = option.cloneNode(true);
+      destination.appendChild(routeOption);
     });
-    select.value = app.country || 'GH';
+    select.value = app.country || 'IN';
+    destination.value = '';
     updateCurrencyPreview();
   } catch (e) {
     say('Could not load countries. Refresh the page and try again.', 'error');
@@ -346,30 +408,42 @@ async function sendPhoneCode() {
   const country = $('country-select').value;
   $('send-code').disabled = true;
   try {
-    await api('/api/auth/start', { phone, country });
+    const authSdk = await initializeFirebase();
+    if (!firebaseRecaptcha) {
+      firebaseRecaptcha = new authSdk.RecaptchaVerifier(firebaseAuth, 'send-code', { size: 'invisible' });
+    }
+    firebaseConfirmation = await authSdk.signInWithPhoneNumber(firebaseAuth, phoneToE164(phone, country), firebaseRecaptcha);
     $('code-group').hidden = false;
     $('phone-code').focus();
     say('Code sent. Check your text messages.', 'ok');
-  } catch (e) { say(e.message, 'error'); }
+  } catch (e) {
+    if (firebaseRecaptcha) { try { await firebaseRecaptcha.clear(); } catch (ignored) {} firebaseRecaptcha = null; }
+    say(e.message || 'Could not send a code. Check the number and try again.', 'error');
+  }
   finally { $('send-code').disabled = false; }
 }
 
 async function verifyPhoneCode() {
-  const phone = $('phone-number').value.trim();
-  const country = $('country-select').value;
   const code = $('phone-code').value.trim();
+  if (!firebaseConfirmation) { say('Request a new code first.', 'error'); return; }
   $('verify-code').disabled = true;
+  firebaseVerificationInProgress = true;
   try {
-    await api('/api/auth/verify', { phone, country, code });
+    const result = await firebaseConfirmation.confirm(code);
+    firebaseSyncUid = result.user.uid;
+    await api('/api/auth/firebase', { id_token: await result.user.getIdToken() });
+    firebaseConfirmation = null;
     await refresh();
     navigate(app.registered ? 'home' : 'setup');
-    say(app.registered ? 'Phone verified.' : 'Phone verified. Add device approval to continue.', 'ok');
+    say(app.registered ? 'Signed in.' : 'Phone verified. Add device approval to continue.', 'ok');
   } catch (e) { say(e.message, 'error'); }
-  finally { $('verify-code').disabled = false; }
+  finally { firebaseVerificationInProgress = false; $('verify-code').disabled = false; }
 }
 
 async function logout() {
+  if (firebaseAuth && firebaseModules) { try { await firebaseModules.signOut(firebaseAuth); } catch (e) { /* clear server session below */ } }
   try { await api('/api/auth/logout', {}); } catch (e) { /* still clear the local view */ }
+  firebaseSyncUid = null;
   app.authenticated = false;
   app.registered = false;
   app.accountIdentity = null;
@@ -382,6 +456,25 @@ async function logout() {
   navigate('account');
   await refresh();
   say('Signed out.', 'ok');
+}
+
+async function pickContact() {
+  if (!navigator.contacts || typeof navigator.contacts.select !== 'function') {
+    say('Contact picking is not available in this browser. Type the recipient name instead.', 'error');
+    $('typed').focus();
+    return;
+  }
+  try {
+    const contacts = await navigator.contacts.select(['name', 'tel'], { multiple: false });
+    const contact = contacts && contacts[0];
+    const name = contact && contact.name && contact.name[0];
+    const phone = contact && contact.tel && contact.tel[0];
+    if (!name) { say('That contact has no name. Type the recipient instead.', 'error'); return; }
+    app.selectedContact = phone ? { name, phone: phoneToE164(phone, $('recipient-country').value || app.country) } : null;
+    handleCommand('send to ' + name, 'Contact: ' + name);
+  } catch (e) {
+    if (e.name !== 'AbortError') say('Could not read that contact. Type the recipient name instead.', 'error');
+  }
 }
 
 /* ---------- Face ID / Touch ID registration ---------- */
@@ -784,7 +877,13 @@ function showTicket(r) {
   $('pay-tip').hidden = true;
   app.txn = r;
   $('t-amount').textContent = r.amount_text;
-  $('t-to').textContent = 'To ' + r.recipient;
+  $('t-to').textContent = 'To ' + r.recipient
+    + (r.recipient_phone_hint ? ' · phone ending ' + r.recipient_phone_hint : '');
+  const route = r.cross_border_simulated
+    ? 'Cross-border demo: ' + app.country + ' to ' + r.recipient_country + ' (' + app.currency + ' to ' + r.recipient_currency + ', no conversion)'
+    : '';
+  $('t-route').textContent = route;
+  $('t-route').hidden = !route;
   $('t-note').textContent = r.note ? 'For ' + r.note : '';
   $('t-note').hidden = !r.note;
   $('t-change').textContent = r.amount_change ? 'Amount changed: ' + r.amount_change : '';
@@ -792,7 +891,8 @@ function showTicket(r) {
   $('approve').disabled = false;
   $('ticket').hidden = false;
   $('ticket-announcement').textContent = 'Review payment: ' + r.amount_text + ' to ' + r.recipient
-    + (r.note ? ', for ' + r.note : '') + '. Approval sends this exact payment.';
+    + (r.recipient_phone_hint ? ', phone ending ' + r.recipient_phone_hint : '')
+    + (r.note ? ', for ' + r.note : '') + (route ? '. ' + route : '') + '. This is simulated.';
   app.deadline = Date.now() + r.expires_in * 1000;
   tick();
   if (app.timer) clearInterval(app.timer);
@@ -849,11 +949,16 @@ function completeReceipt(record) {
   hideTicket();
   $('receipt-text').textContent = formatMoney(record.amount) + ' to ' + record.to
     + (record.note ? ' for ' + record.note : '');
+  if (record.recipient_country && record.recipient_country !== app.country) {
+    $('receipt-text').textContent += ' · Cross-border simulation to ' + record.recipient_country;
+  }
+  if (record.recipient_phone_hint) $('receipt-text').textContent += ' · phone ending ' + record.recipient_phone_hint;
   $('receipt-reference').textContent = 'Reference: ' + (record.reference || 'available in recent payments');
   $('receipt').hidden = false;
   $('pay-tip').hidden = true;
   navigate('pay');
   app.lastPayment = record;
+  app.selectedContact = null;
   app.recentContacts = [record.to, ...app.recentContacts.filter((name) => name !== record.to)].slice(0, 3);
   setChips(startChips());
   say('Payment complete. Keep this reference for your records.', 'ok');
@@ -864,7 +969,9 @@ function completeReceipt(record) {
 function onRepeatLastPayment() {
   const payment = app.lastPayment;
   if (!payment) return;
-  const command = 'send ' + Number(payment.amount).toFixed(2) + ' cedis to ' + payment.to
+  $('recipient-country').value = payment.recipient_country && payment.recipient_country !== app.country
+    ? payment.recipient_country : '';
+  const command = 'send ' + Number(payment.amount).toFixed(2) + ' to ' + payment.to
     + (payment.note ? ' for ' + payment.note : '');
   $('receipt').hidden = true;
   handleCommand(command, 'Prepare again: ' + formatMoney(payment.amount) + ' to ' + payment.to);
@@ -872,6 +979,7 @@ function onRepeatLastPayment() {
 
 async function onCancel() {
   hideTicket();
+  app.selectedContact = null;
   try { await api('/api/cancel', {}); } catch (e) { /* the ticket expires by itself */ }
   setChips([]);
   addMessage('bot', 'Cancelled. Nothing was sent.');
@@ -949,6 +1057,8 @@ async function start() {
     $('setup-prepare').focus();
   });
   $('country-select').addEventListener('change', updateCurrencyPreview);
+  $('recipient-country').addEventListener('change', () => { app.selectedContact = null; });
+  $('pick-contact').addEventListener('click', pickContact);
   $('send-code').addEventListener('click', sendPhoneCode);
   $('verify-code').addEventListener('click', verifyPhoneCode);
   $('logout').addEventListener('click', logout);
@@ -956,7 +1066,10 @@ async function start() {
   $('sound').textContent = '♫';
   $('sound').setAttribute('aria-pressed', 'false');
   $('language').value = LANG;
-  $('language').addEventListener('change', (event) => { LANG = event.target.value; });
+  $('language').addEventListener('change', (event) => {
+    LANG = event.target.value;
+    if (firebaseAuth) firebaseAuth.languageCode = LANG;
+  });
 
   addMessage('bot', 'Who would you like to pay?');
   setChips(startChips());
@@ -967,6 +1080,7 @@ async function start() {
 
   await loadCountryOptions();
   try { await refresh(); } catch (e) { say(e.message, 'error'); }
+  try { await initializeFirebase(); } catch (e) { console.info('Firebase sign-in is not ready:', e.message); }
 }
 
 start();

@@ -2,14 +2,18 @@
 
 Talk through a payment, approve it with Face ID or Touch ID. **Simulation only: no real money moves.**
 
-How it works: verify a phone number, select its country and currency, describe the payment by voice
+How it works: verify a phone number, use its country and currency, describe the payment by voice
 or text, review the details, then approve with this device's built-in authenticator. A Groq language
 model interprets commands and the server checks them. If the model is unavailable, simple rules still
 understand common commands.
 
-Country and currency context is selected at account setup and sent with the payment sentence; the
-model is not retrained for each country. Phone formats and current country currencies come from the
-included international metadata libraries.
+Phone sign-in uses Firebase Authentication. The verified phone region selects that user's country and
+currency; India (INR) is the default before sign-in. The model receives the selected currency and
+destination context at request time, so it is not trained for Ghana or retrained for each country.
+Phone formats and current country currencies come from international metadata libraries.
+
+The payment screen can prepare a cross-border demo route using a selected destination country or a
+phone contact. It does not call a remittance provider, calculate an exchange rate, or move money.
 
 The interface has separate Home, Pay, Balance, Activity, Device Security, and Settings views. Balance
 and Activity hide again when you leave their screens. The opening view introduces the demo before a
@@ -24,10 +28,12 @@ pip install -r requirements.txt
 cp .env.example .env              # Windows: copy .env.example .env
 ```
 
-Open `.env` and set `GROQ_API_KEY`, the three Twilio Verify values, and an owner diagnostic token.
-Twilio Verify sends and checks phone verification codes. Create a Verify Service in Twilio, then copy
-the Account SID, Auth Token, and Verify Service SID into `.env`. SMS availability and charges depend
-on the destination country and your Twilio account.
+Open Firebase Console, create a project and web app, enable Phone sign-in, set the SMS region policy,
+and add your deployed domain to Authorized domains. Link a Cloud Billing account; Firebase may charge
+for SMS. For local development, use Firebase's fictional test phone numbers; live web phone auth needs
+an authorized hosted domain. Copy the Web app's API key, Auth domain, Project ID, and App ID into `.env`. Create a service
+account for Firebase Admin, download its private JSON, and set that JSON as
+`FIREBASE_SERVICE_ACCOUNT_JSON`. Never commit the service account key.
 
 ```
 python -c "import secrets; print(secrets.token_urlsafe(32))"
@@ -101,9 +107,11 @@ Under **Environment** add these variables:
 | `RP_ID` | your Render address **without** https, for example `voicepay-ab12.onrender.com` |
 | `ORIGIN` | the same address **with** https, for example `https://voicepay-ab12.onrender.com` |
 | `SETUP_TOKEN` | optional long random owner secret for private diagnostics |
-| `TWILIO_ACCOUNT_SID` | Twilio account SID |
-| `TWILIO_AUTH_TOKEN` | Twilio auth token |
-| `TWILIO_VERIFY_SERVICE_SID` | Twilio Verify Service SID |
+| `FIREBASE_API_KEY` | Firebase Web app API key |
+| `FIREBASE_AUTH_DOMAIN` | Firebase Web app auth domain |
+| `FIREBASE_PROJECT_ID` | Firebase project ID |
+| `FIREBASE_APP_ID` | Firebase Web app ID |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | private service account JSON for server-side token verification |
 | `ALLOW_RESET` | `0` (reset is disabled by default) |
 | `PROXY_FIX_HOPS` | `1` for the single trusted Render proxy |
 | `REDIS_URL` | a Redis connection URL for rate limits shared across workers/instances |
@@ -123,14 +131,14 @@ You can give everything in one sentence, or let the assistant ask for what is mi
 
 > **You:** I want to send some money
 > **VoicePay:** How much would you like to send?
-> **You:** Fifty cedis
-> **VoicePay:** Got it, GHS 50.00. Who should receive it?
-> **You:** Kofi
-> **VoicePay:** Got it, to Kofi. What is it for? You can say skip.
+> **You:** Five hundred rupees
+> **VoicePay:** Got it, INR 500.00. Who should receive it?
+> **You:** Priya
+> **VoicePay:** Got it, to Priya. What is it for? You can say skip.
 > **You:** Lunch
 > *(confirmation ticket appears: tap Approve and use your face or fingerprint)*
 
-- Say "send 50 cedis to Kofi for lunch" to skip all the questions.
+- Say "send 500 rupees to Priya for lunch" to skip all the questions.
 - While the ticket is showing you can still change it ("make it 60") or say "cancel".
 - Voice replies and automatic listening are **off by default**. Turn them on with the header control; tap the mic to start a voice command.
 - Typed and browser-recognized text is sent to this server and may be processed by Groq. If browser speech recognition is unavailable, microphone audio is sent to Groq for transcription and is not stored by VoicePay.
@@ -138,7 +146,10 @@ You can give everything in one sentence, or let the assistant ask for what is mi
 - Device confirmation always needs a tap. A browser will not let a voice command trigger it.
 - On the web, Face ID / Touch ID is reached through WebAuthn's platform authenticator. The website cannot call a separate raw Face ID API; the browser may label this a passkey. The device can also request a screen lock or PIN. A native iOS/Android app would be needed for a platform-specific native flow.
 - The browser biometric prompt may be generic and may not display the payee or amount. The server challenge binds amount, recipient, note, payment ID, and browser session; check the visible ticket before approving. Native payment details need a separate Secure Payment Confirmation registration/Payment Request flow, which this prototype does not implement.
-- Allowed demo contacts: Kofi, Ama, Mum, Kwame. The demo daily limit is 500 units in the selected account currency. Change both at the top of `app.py`.
+- The contact picker uses the browser's explicit contact-selection permission where supported. A selected phone is used only to identify its destination country and show its last four digits on the ticket; VoicePay does not send the number to Groq or store it in the ledger. You can also type a recipient name directly; review it on the approval ticket.
+- Choose a destination country for a cross-border demo. It records the source and destination currencies but does not quote FX, connect to a remittance provider, or move funds.
+- India is the default country. A verified phone number selects the account country and currency. The amount parser receives that currency as context and accepts number words, digits, and common currency symbols/codes.
+- The demo daily limit is 500 units in the selected account currency. Change it at the top of `app.py`.
 
 ## 4b. Balance privacy
 
@@ -149,7 +160,7 @@ The balance is **never shown by default** and never leaves the server unless you
 | The page and `/api/state` | Not included. The page shows `••••••`. |
 | Payment history | Not included in `/api/state`. `/api/history/reveal` requires a fresh, one-time biometric signature; the page hides it again after 10 seconds or when you switch tabs. |
 | Chat replies and spoken replies | Never contain it. "What is my balance?" only points to the Show balance button. |
-| The AI model (Groq) | Never sees the balance. It gets the selected currency and payment sentence to parse amount / recipient / note. The server decides every next step. |
+| The AI model (Groq) | Never sees the balance. It gets the selected account and destination currency plus the payment sentence to parse amount / recipient / note. The server decides every next step. |
 | Showing it on screen | Only `/api/balance/reveal`, which needs a fresh Face ID / Touch ID signature tied to that one request. It works once, then the page hides it again after 10 seconds, when you switch tabs, or when you tap Hide now. |
 | Guessing balance or daily spend by trying amounts | Funds and daily limits are checked only after Face ID. Before then, every eligible amount gets the same review flow. |
 | Someone else's browser | Every browser gets its own private session. A ticket or unlock from one browser is rejected in another. |
@@ -181,11 +192,11 @@ Each account has a separate demo ledger. Do not put real payment or sensitive pe
 | Biometric registration does not work | Check `RP_ID` and `ORIGIN` in owner-only `/api/health/details` and confirm they match the browser address. |
 | Face ID / Touch ID button does nothing or says it needs https | Use `localhost` on a laptop, or the https tunnel address on a phone. |
 | "Could not register this device" | `RP_ID` or `ORIGIN` does not match the address in the browser. Run `python check_setup.py`. |
-| Phone code will not send | Check the Twilio Account SID, Auth Token, Verify Service SID, and destination country support. |
+| Phone code will not send | Check Firebase Phone sign-in, the SMS region policy, authorized domain, web config, billing status, and service account credentials. |
 | Device registration does not appear | Verify your phone number first, then open **Secure** and tap **Prepare device**. |
 | Approval says "Biometric check failed" | You are on a different address than the one you registered on. Update `.env`, restart, register again. |
 | Mic does nothing | Open the site over HTTPS, allow microphone access, and tap the mic again. VoicePay uses browser recognition when available and Groq transcription as a fallback. |
-| Speech is misheard | Choose English (Ghana), English (UK), or English (US) from the language selector; review the transcript before it is sent. |
+| Speech is misheard | Choose the available English speech locale that matches your accent; review the transcript before it is sent. |
 | Voice recognition is unavailable | Try the mic recorder fallback or use the text field. Voice transcripts are shown for review before sending. |
 | Enhanced command understanding is unavailable | The Groq key may be missing or rate limited. Basic amount and contact commands still work. |
 | Groq says a model was not found | Groq changes its model list. Set `GROQ_MODELS` in `.env` to current model names from the Groq console. |

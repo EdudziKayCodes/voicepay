@@ -12,14 +12,16 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.pop('GROQ_API_KEY', None)  # test with the rule-based parser only
 os.environ['RP_ID'] = 'localhost'
 os.environ['ORIGIN'] = 'http://localhost:5000'
 os.environ['SETUP_TOKEN'] = 'test-owner-setup-token'
-os.environ['TWILIO_ACCOUNT_SID'] = 'test-account'
-os.environ['TWILIO_AUTH_TOKEN'] = 'test-token'
-os.environ['TWILIO_VERIFY_SERVICE_SID'] = 'test-service'
+os.environ['FIREBASE_API_KEY'] = 'test-api-key'
+os.environ['FIREBASE_AUTH_DOMAIN'] = 'test.firebaseapp.com'
+os.environ['FIREBASE_PROJECT_ID'] = 'test-project'
+os.environ['FIREBASE_APP_ID'] = 'test-app'
 os.environ['ALLOW_RESET'] = '0'
 TEST_HOME = Path(tempfile.mkdtemp())
 os.environ['VOICEPAY_DATA_FILE'] = str(TEST_HOME / 'data.json')
@@ -32,7 +34,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 import app as vp
 
 ORIGIN, RP = 'http://localhost:5000', 'localhost'
-SECRET = ['GH₵1,000.00', 'GH₵950.00', 'GH₵900.00']  # hidden balances and derived balances
+SECRET = ['1,000.00', '950.00', '900.00']  # hidden balances and derived balances
 failures = []
 seen = []  # every reply body the server ever sent to the page
 
@@ -89,29 +91,33 @@ def chat(client, text):
 
 
 vp.app.config['TESTING'] = True
-vp.twilio_verify = lambda path, values: {'status': 'pending' if path == 'Verifications' else 'approved'}
+vp.FIREBASE_READY = True
+firebase_phones = {'alice-token': '+919876543210', 'other-token': '+919876543211'}
+vp.firebase_auth.verify_id_token = lambda token, app=None, check_revoked=False: {
+    'uid': token, 'phone_number': firebase_phones[token]}
+vp.firebase_auth.get_user = lambda uid, app=None: SimpleNamespace(phone_number=firebase_phones[uid])
 alice = vp.app.test_client()
 phone = Phone()
 
 
-def authenticate(client, number):
-    code, _ = call(client, 'POST', '/api/auth/start', {'phone': number, 'country': 'GH'})
-    check('phone verification can be started', code == 200)
-    code, _ = call(client, 'POST', '/api/auth/verify',
-                   {'phone': number, 'country': 'GH', 'code': '123456'})
-    check('phone account is verified', code == 200)
+def authenticate(client, token):
+    code, _ = call(client, 'POST', '/api/auth/firebase', {'id_token': token})
+    check('Firebase verified phone account is accepted', code == 200)
 
 print('Setup')
 _, state = call(alice, 'GET', '/api/state')
 check('/api/state has no balance field', not any('balance' in k for k in state))
 check('/api/state does not disclose history', 'history' not in state)
-authenticate(alice, '0241234567')
+authenticate(alice, 'alice-token')
 _, reg = call(alice, 'POST', '/api/register/options', {})
 code, _ = call(alice, 'POST', '/api/register/verify', {'credential': phone.register(reg)})
 check('device registered', code == 200)
 other = vp.app.test_client()
-authenticate(other, '0201234567')
-code, _ = call(other, 'POST', '/api/register/options', {})
+authenticate(other, 'other-token')
+other_phone = Phone()
+code, other_reg = call(other, 'POST', '/api/register/options', {})
+if code == 200:
+    code, _ = call(other, 'POST', '/api/register/verify', {'credential': other_phone.register(other_reg)})
 check('another verified account can register its own device', code == 200)
 alice_user = vp.user_for_auth_token(alice.get_cookie('vp_auth').value)
 
@@ -121,11 +127,9 @@ check('asks how much', r['expects'] == 'amount')
 r = chat(alice, '50')
 check('asks who next', r['expects'] == 'recipient' and '50.00' in r['message'])
 r = chat(alice, 'Yaw')
-check('refuses someone who is not an exact contact and asks again', r['expects'] == 'recipient' and 'exact contact' in r['message'])
-r = chat(alice, 'Kofi')
-check('asks what it is for', r['expects'] == 'note')
+check('accepts a recipient name typed during the transaction', r['expects'] == 'note' and 'Yaw' in r['message'])
 r = chat(alice, 'for lunch')
-check('shows the confirmation ticket', r['kind'] == 'confirm' and r['recipient'] == 'Kofi' and r['note'] == 'lunch')
+check('shows the confirmation ticket', r['kind'] == 'confirm' and r['recipient'] == 'Yaw' and r['note'] == 'lunch')
 first = r
 r = chat(alice, 'make it 60')
 check('changing the amount issues a new ticket', r['kind'] == 'confirm' and '60.00' in r['amount_text'] and r['txn_id'] != first['txn_id'])
@@ -146,11 +150,11 @@ check("a payment approval cannot be reused to unlock the balance", code == 401 a
 print('\nPayments')
 r = chat(alice, 'cancel')
 check('cancel clears the conversation', 'cancelled' in r['message'])
-r = chat(alice, 'send 5000 cedis to Ama for rent')
+r = chat(alice, 'send 5000 rupees to Ananya for rent')
 check('a large amount gets the same pre-biometric review flow', r['kind'] == 'confirm'
       and 'daily limit' not in json.dumps(r).lower())
 chat(alice, 'cancel')
-r = chat(alice, 'send 50 to Kofi for lunch')
+r = chat(alice, 'send 50 rupees to Aarav for lunch')
 check('one sentence goes straight to the ticket', r['kind'] == 'confirm')
 chat(other, 'hello')
 code, _ = call(other, 'POST', '/api/approve', {'txn_id': r['txn_id'], 'credential': phone.sign(r['options'])})
@@ -171,14 +175,14 @@ check('the unlock works only once', code == 410)
 print('\nNot enough money')
 with vp.db_connect() as conn:
     conn.execute("INSERT INTO ledger(kind,amount_cents,created,note,owner_id,currency) VALUES('reset',?,?,?,?,?)",
-                 (-92000, int(time.time()), 'test-only adjustment', alice_user['id'], 'GHS'))
-r = chat(alice, 'send 40 to Ama for snacks')
+                 (-92000, int(time.time()), 'test-only adjustment', alice_user['id'], 'INR'))
+r = chat(alice, 'send 40 rupees to Ananya for snacks')
 check('no hint of low funds before Face ID: the ticket is issued as normal', r['kind'] == 'confirm')
 code, res = call(alice, 'POST', '/api/approve', {'txn_id': r['txn_id'], 'credential': phone.sign(r['options'])})
-check('after Face ID it says insufficient funds, and nothing is sent', code == 400 and 'Insufficient' in res['error'] and vp.ledger_balance(alice_user['id'], 'GHS') == 30.0)
+check('after Face ID it says insufficient funds, and nothing is sent', code == 400 and 'Insufficient' in res['error'] and vp.ledger_balance(alice_user['id'], 'INR') == 30.0)
 with vp.db_connect() as conn:
     conn.execute("INSERT INTO ledger(kind,amount_cents,created,note,owner_id,currency) VALUES('reset',?,?,?,?,?)",
-                 (92000, int(time.time()), 'test-only adjustment', alice_user['id'], 'GHS'))
+                 (92000, int(time.time()), 'test-only adjustment', alice_user['id'], 'INR'))
 
 print('\nHistory privacy')
 _, state = call(alice, 'GET', '/api/state')

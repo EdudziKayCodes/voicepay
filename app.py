@@ -34,14 +34,14 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 import phonenumbers
+import firebase_admin
+from firebase_admin import auth as firebase_auth, credentials as firebase_credentials
 from babel import Locale
 from babel.numbers import format_currency, get_currency_name, get_currency_precision, get_territory_currencies
 
@@ -90,7 +90,7 @@ MODELS = [
 RP_ID = os.environ.get('RP_ID', 'localhost').strip()
 ORIGINS = [o.strip().rstrip('/') for o in os.environ.get('ORIGIN', 'http://localhost:5000').split(',') if o.strip()]
 RP_NAME = 'VoicePay'
-CURRENCY = 'GHS'
+CURRENCY = 'INR'
 STARTING_BALANCE = 1000.00
 DAILY_LIMIT = 500.00
 PENDING_TTL = 120  # seconds a pending payment stays valid
@@ -99,14 +99,29 @@ REVEAL_SECONDS = 10  # how long the page may show the balance after a biometric 
 DIALOG_TTL = 900  # forget an unfinished conversation after 15 minutes
 ALLOW_RESET = os.environ.get('ALLOW_RESET', '0') == '1'  # opt in only for controlled demos
 SETUP_TOKEN = os.environ.get('SETUP_TOKEN', '').strip()
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
-TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
-TWILIO_VERIFY_SERVICE_SID = os.environ.get('TWILIO_VERIFY_SERVICE_SID', '').strip()
+FIREBASE_API_KEY = os.environ.get('FIREBASE_API_KEY', '').strip()
+FIREBASE_AUTH_DOMAIN = os.environ.get('FIREBASE_AUTH_DOMAIN', '').strip()
+FIREBASE_PROJECT_ID = os.environ.get('FIREBASE_PROJECT_ID', '').strip()
+FIREBASE_APP_ID = os.environ.get('FIREBASE_APP_ID', '').strip()
+FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON', '').strip()
 AUTH_SESSION_DAYS = 30
 AUDIO_MODEL = os.environ.get('AUDIO_MODEL', 'whisper-large-v3-turbo').strip()
 
-CONTACTS = ['Kofi', 'Ama', 'Mum', 'Kwame']
+CONTACTS = ['Aarav', 'Ananya', 'Mum', 'Friend']
 ALIASES = {'mom': 'Mum', 'mother': 'Mum', 'mummy': 'Mum', 'mama': 'Mum'}
+
+FIREBASE_APP = None
+try:
+    if FIREBASE_SERVICE_ACCOUNT_JSON:
+        FIREBASE_APP = firebase_admin.initialize_app(firebase_credentials.Certificate(
+            json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)))
+    elif os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
+        FIREBASE_APP = firebase_admin.initialize_app()
+except Exception as exc:
+    print('Firebase Admin could not initialize: {}'.format(type(exc).__name__))
+
+FIREBASE_READY = bool(FIREBASE_APP and FIREBASE_API_KEY and FIREBASE_AUTH_DOMAIN and
+                      FIREBASE_PROJECT_ID and FIREBASE_APP_ID)
 
 client = (
     OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_API_KEY, timeout=15.0, max_retries=1)
@@ -139,7 +154,6 @@ DIALOGS = {}  # session id -> the conversation in progress
 FAILS = {}  # session id -> failed biometric attempts
 HITS = {}  # client address -> recent request times (rate limit)
 REG = {}  # registration challenges are per browser session
-PHONE_PENDING = {}  # phone verification attempts; provider owns OTP lifecycle
 SESSION_LOCKS = [threading.RLock() for _ in range(256)]
 
 
@@ -165,13 +179,16 @@ def initialize_ledger():
                 idempotency_key TEXT UNIQUE,
                 session_id TEXT,
                 owner_id TEXT NOT NULL DEFAULT '__legacy__',
-                currency TEXT NOT NULL DEFAULT 'GHS'
+                currency TEXT NOT NULL DEFAULT 'INR',
+                recipient_country TEXT,
+                recipient_currency TEXT
             );
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 phone TEXT NOT NULL UNIQUE,
                 country TEXT NOT NULL,
                 currency TEXT NOT NULL,
+                firebase_uid TEXT UNIQUE,
                 created INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS passkeys (
@@ -200,6 +217,14 @@ def initialize_ledger():
             conn.execute("ALTER TABLE ledger ADD COLUMN owner_id TEXT NOT NULL DEFAULT '__legacy__'")
         if 'currency' not in columns:
             conn.execute("ALTER TABLE ledger ADD COLUMN currency TEXT NOT NULL DEFAULT 'GHS'")
+        if 'recipient_country' not in columns:
+            conn.execute('ALTER TABLE ledger ADD COLUMN recipient_country TEXT')
+        if 'recipient_currency' not in columns:
+            conn.execute('ALTER TABLE ledger ADD COLUMN recipient_currency TEXT')
+        user_columns = {row['name'] for row in conn.execute('PRAGMA table_info(users)').fetchall()}
+        if 'firebase_uid' not in user_columns:
+            conn.execute('ALTER TABLE users ADD COLUMN firebase_uid TEXT')
+            conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS users_by_firebase_uid ON users(firebase_uid)')
         conn.execute('CREATE INDEX IF NOT EXISTS ledger_by_user ON ledger(owner_id,currency,created)')
         if conn.execute('SELECT COUNT(*) FROM ledger').fetchone()[0] == 0:
             legacy = {}
@@ -306,11 +331,13 @@ def ledger_history(user_id=None, currency=None, limit=8):
     currency = currency or current_currency()
     factor = minor_factor(currency)
     with closing(db_connect()) as conn:
-        rows = conn.execute("SELECT recipient AS 'to',amount_cents,note,created AS time,idempotency_key AS reference "
+        rows = conn.execute("SELECT recipient AS 'to',amount_cents,note,created AS time,idempotency_key AS reference, "
+                            "recipient_country,recipient_currency "
                             "FROM ledger WHERE kind='payment' AND owner_id=? AND currency=? ORDER BY id DESC LIMIT ?",
                             (user_id, currency, limit)).fetchall()
     return [{'to': r['to'], 'amount': round(-r['amount_cents'] / factor, get_currency_precision(currency)), 'note': r['note'],
-             'time': r['time'], 'reference': r['reference']} for r in reversed(rows)]
+             'time': r['time'], 'reference': r['reference'], 'recipient_country': r['recipient_country'],
+             'recipient_currency': r['recipient_currency'], 'currency': currency} for r in reversed(rows)]
 
 
 def ledger_payment(key, sid, user_id=None, currency=None):
@@ -318,13 +345,15 @@ def ledger_payment(key, sid, user_id=None, currency=None):
     currency = currency or current_currency()
     factor = minor_factor(currency)
     with closing(db_connect()) as conn:
-        row = conn.execute("SELECT recipient AS 'to',amount_cents,note,created AS time,idempotency_key AS reference "
+        row = conn.execute("SELECT recipient AS 'to',amount_cents,note,created AS time,idempotency_key AS reference, "
+                           "recipient_country,recipient_currency "
                            "FROM ledger WHERE kind='payment' AND idempotency_key=? AND session_id=? AND owner_id=? AND currency=?",
                            (key, sid, user_id, currency)).fetchone()
     if row is None:
         return None
     return {'to': row['to'], 'amount': round(-row['amount_cents'] / factor, get_currency_precision(currency)), 'note': row['note'],
-            'time': row['time'], 'reference': row['reference']}
+            'time': row['time'], 'reference': row['reference'], 'currency': currency,
+            'recipient_country': row['recipient_country'], 'recipient_currency': row['recipient_currency']}
 
 
 def append_reset(user_id, currency):
@@ -384,18 +413,6 @@ def parsed_phone(value, country):
     return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
 
 
-def twilio_verify(path, values):
-    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_VERIFY_SERVICE_SID):
-        raise RuntimeError('Phone verification is not configured on this server.')
-    token = base64.b64encode((TWILIO_ACCOUNT_SID + ':' + TWILIO_AUTH_TOKEN).encode('utf-8')).decode('ascii')
-    url = 'https://verify.twilio.com/v2/Services/{}/{}'.format(TWILIO_VERIFY_SERVICE_SID, path)
-    req = Request(url, data=urlencode(values).encode('utf-8'), headers={
-        'Authorization': 'Basic ' + token, 'Content-Type': 'application/x-www-form-urlencoded',
-    })
-    with urlopen(req, timeout=12) as response:
-        return json.loads(response.read().decode('utf-8'))
-
-
 def user_for_auth_token(token):
     if not token or len(token) > 128:
         return None
@@ -427,7 +444,7 @@ def require_user():
 # --------------------------------------------------------------------------
 def fmt_money(amount):
     currency = current_currency()
-    country = getattr(g, 'country', 'GH')
+    country = getattr(g, 'country', 'IN')
     try:
         return format_currency(amount, currency, locale='en_' + country)
     except Exception:
@@ -510,10 +527,11 @@ def challenge_for(item):
     """The WebAuthn challenge is a hash of this exact action, bound to this browser session.
     A signature made for a payment can never unlock the balance, and the other way round."""
     if item['kind'] in ('reveal', 'history'):
-        parts = ['voicepay-v4', item['kind'], item['sid'], item['user_id'], item['nonce']]
+        parts = ['voicepay-v5', item['kind'], item['sid'], item['user_id'], item['nonce']]
     else:
-        parts = ['voicepay-v4', 'pay', item['id'], '{:.8f}'.format(item['amount']), item['currency'],
-                 item['recipient'], item.get('note', ''), item['nonce'], item['sid'], item['user_id']]
+        parts = ['voicepay-v5', 'pay', item['id'], '{:.8f}'.format(item['amount']), item['currency'],
+                 item['recipient'], item.get('recipient_country', ''), item.get('recipient_currency', ''),
+                 item.get('recipient_phone_hint', ''), item.get('note', ''), item['nonce'], item['sid'], item['user_id']]
     return hashlib.sha256('|'.join(parts).encode('utf-8')).digest()
 
 
@@ -670,7 +688,7 @@ SYSTEM_PROMPT = (
     'Keys: intent, amount (number or null), recipient (string or null), note (short string or null). '
     'intent is one of: send_money (they want to pay, or are giving or changing payment details), '
     'check_balance (any question about how much money they have), yes, no, cancel, skip (no note wanted), unknown. '
-    'Known contacts: ' + ', '.join(CONTACTS) + '. '
+    'Suggested sample contacts: ' + ', '.join(CONTACTS) + '. The recipient may also be any person the user names directly. '
     'Rules: convert number words to digits (thirty becomes 30). Treat mum, mom and mummy as Mum. '
     'If the person names someone who is not a known contact, copy the name exactly as spoken. '
     'Use null for anything that was not said. The note is the reason for the payment, for example lunch or school fees. '
@@ -686,7 +704,10 @@ SYSTEM_PROMPT = (
 def system_prompt(dialog):
     known = {k: dialog[k] for k in ('amount', 'recipient', 'note') if dialog and dialog.get(k) is not None}
     asked = (dialog or {}).get('awaiting') or 'nothing'
+    destination = COUNTRY_MAP.get((dialog or {}).get('recipient_country') or getattr(g, 'country', 'IN'), {})
     return (SYSTEM_PROMPT + ' Account currency: ' + current_currency() + ' (' + currency_word() + '). '
+            'Destination country and currency: ' + str(destination.get('name', 'India')) + ' / ' +
+            str(destination.get('currency', current_currency())) + '. '
             'Details collected so far: ' + json.dumps(known) + '. The assistant just asked about: ' + asked + '.')
 
 
@@ -747,8 +768,10 @@ def words_to_number(words):
             current += TENS[word]
         elif word == 'hundred':
             current = max(current, 1) * 100
-        elif word == 'thousand':
-            total += max(current, 1) * 1000
+        elif word in ('thousand', 'lakh', 'lac', 'million', 'crore', 'billion'):
+            scale = {'thousand': 1000, 'lakh': 100000, 'lac': 100000,
+                     'million': 1000000, 'crore': 10000000, 'billion': 1000000000}[word]
+            total += max(current, 1) * scale
             current = 0
         elif word == 'and':
             continue
@@ -761,7 +784,7 @@ def words_to_number(words):
 def number_from_words(words):
     run = []
     for word in list(words) + ['']:
-        if word in UNITS or word in TENS or word in ('hundred', 'thousand') or (word == 'and' and run):
+        if word in UNITS or word in TENS or word in ('hundred', 'thousand', 'lakh', 'lac', 'million', 'crore', 'billion') or (word == 'and' and run):
             run.append(word)
             continue
         if run:
@@ -775,58 +798,71 @@ def number_from_words(words):
 
 
 def _numeric_value(text):
-    match = re.search(r'(?<![a-z])\d+(?:\.\d{1,2})?', text)
-    if match:
-        return float(match.group())
-    return number_from_words(re.findall(r"[a-z']+", text.lower()))
+    value = re.sub(r'(?<=\d),(?=\d{2,3}(?:\D|$))', '', str(text).strip().lower())
+    if re.fullmatch(r'\d+(?:\.\d+)?', value):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    words = re.findall(r"[a-z']+", value)
+    if 'point' in words:
+        index = words.index('point')
+        whole = words_to_number(words[:index])
+        fractional_words = words[index + 1:]
+        digits = []
+        for word in fractional_words:
+            if word in UNITS and UNITS[word] < 10:
+                digits.append(str(UNITS[word]))
+            else:
+                return None
+        return float(str(whole or 0) + '.' + ''.join(digits)) if digits else None
+    return words_to_number(words)
 
 
 def amount_mentioned(text, awaiting=None):
     """Extract money only from an amount-shaped phrase, never an unrelated note digit."""
-    t = re.sub(r'(?<=\d),(?=\d{3})', '', text.lower()).strip()
+    t = re.sub(r'(?<=\d),(?=\d{2,3}(?:\D|$))', '', text.lower()).strip()
     currency_code = current_currency()
-    code = re.escape(currency_code.lower())
-    names = {str(get_currency_name(currency_code, locale='en')).lower(),
-             str(get_currency_name(currency_code, count=2, locale='en')).lower()}
-    if currency_code == 'GHS': names.update({'cedi', 'cedis', 'ghana cedi', 'ghana cedis'})
-    if currency_code == 'USD': names.update({'dollar', 'dollars', 'buck', 'bucks'})
-    if currency_code == 'EUR': names.update({'euro', 'euros'})
-    name_pattern = '|'.join(re.escape(name) for name in sorted(names, key=len, reverse=True))
-    symbol = re.escape(get_currency_symbol(currency_code, locale='en'))
-    currency_pattern = r'(?:\b' + code + r'\b|\b(?:' + name_pattern + r')\b|' + symbol + r')'
-    currency = re.search(currency_pattern, t)
-    pesewa = (re.search(r'(?P<num>\d{1,2}|[a-z]+(?:\s+[a-z]+)?)\s+pesewas?\b', t)
-              if currency_code == 'GHS' else None)
-    pesewa_value = _numeric_value(pesewa.group('num')) if pesewa else 0
+    names = {
+        str(get_currency_name(currency_code, locale='en')).lower(),
+        str(get_currency_name(currency_code, count=2, locale='en')).lower(),
+    }
+    aliases = {'INR': {'rupee', 'rupees', 'indian rupees'}, 'GHS': {'cedi', 'cedis', 'ghana cedi', 'ghana cedis'},
+               'USD': {'dollar', 'dollars', 'buck', 'bucks'}, 'EUR': {'euro', 'euros'},
+               'GBP': {'pound', 'pounds', 'sterling'}, 'JPY': {'yen'}}
+    names.update(aliases.get(currency_code, set()))
+    marker = (r'(?:\b' + re.escape(currency_code.lower()) + r'\b|\b(?:' +
+              '|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True)) +
+              r')\b|' + re.escape(get_currency_symbol(currency_code, locale='en')) + r')')
     base = None
-    if currency:
-        base = _numeric_value(t[:currency.start()])
-    if base is None and pesewa and not currency:
-        base = 0
+    # A currency marker may precede or follow the spoken/numeric amount.
+    for match in re.finditer(marker, t):
+        before = re.split(r'\b(?:send|pay|transfer|give|wire|make|it|for|to)\b', t[:match.start()])[-1].strip()
+        after = re.split(r'\b(?:to|for|because|as)\b', t[match.end():], maxsplit=1)[0].strip()
+        base = _numeric_value(after) if after else _numeric_value(before)
+        if base is None:
+            base = _numeric_value(before)
+        if base is not None:
+            break
     if base is None and awaiting in ('amount', 'confirm'):
         phrase = t
         if awaiting == 'confirm':
             change = re.match(r'^(?:make it|change (?:the )?amount to|set (?:the )?amount to|change it to)\s+(.+)$', phrase)
             if change:
                 phrase = re.split(r'\b(?:for|to)\b', change.group(1), maxsplit=1)[0]
-            elif not re.fullmatch(r'[\d.,\s]+|[a-z\s]+', phrase):
-                phrase = ''
-        phrase = re.sub(currency_pattern + r'|\bpesewas?\b', ' ', phrase)
-        if re.fullmatch(r"[\d.,\s]+|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
-                        r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
-                        r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|and|\s)+", phrase):
-            base = _numeric_value(phrase)
+        phrase = re.sub(marker, ' ', phrase)
+        base = _numeric_value(phrase)
     if base is None:
         verb = re.search(r'\b(?:send|pay|transfer|give|wire)\b', t)
         if verb:
             phrase = t[verb.end():]
             phrase = re.split(r'\b(?:to|for|because)\b', phrase, maxsplit=1)[0]
+            phrase = re.sub(marker, ' ', phrase)
             base = _numeric_value(phrase)
     if base is None:
         return None
     precision = get_currency_precision(current_currency())
-    amount = round(base + (pesewa_value / 100.0), precision)
-    return amount
+    return round(base, precision)
 
 
 def recipient_mentioned(text, awaiting=None):
@@ -871,7 +907,7 @@ SKIP_WORDS = {'skip', 'no note', 'nothing', 'none', 'no thanks', 'no reason', 'l
 
 def fallback_parse(text, awaiting=None):
     """Plain rules, used when the AI is unavailable so the demo never dies."""
-    t = re.sub(r'(?<=\d),(?=\d{3})', '', text.lower()).strip()
+    t = re.sub(r'(?<=\d),(?=\d{2,3}(?:\D|$))', '', text.lower()).strip()
     plain = t.strip(' .,!?')
     words = re.findall(r"[a-z']+", t)
 
@@ -940,7 +976,9 @@ def understand(text, dialog):
 # The guided conversation (a small state machine, NOT the AI, decides what to ask)
 # --------------------------------------------------------------------------
 def new_dialog():
-    return {'amount': None, 'recipient': None, 'note': None, 'note_done': False,
+    return {'amount': None, 'recipient': None, 'recipient_country': getattr(g, 'country', 'IN'),
+            'recipient_currency': getattr(g, 'currency', CURRENCY), 'recipient_phone_hint': '',
+            'note': None, 'note_done': False,
             'awaiting': None, 'txn_id': None, 'updated': time.time(), 'amount_change': None}
 
 
@@ -1003,10 +1041,11 @@ def apply_command(dialog, cmd):
             if suggestion:
                 problem = ('Did you mean {}? Choose a contact below to confirm.'.format(suggestion),
                            'recipient', suggestion)
+            elif re.fullmatch(r"[^\W\d_][\w'’.-]*(?:\s+[^\W\d_][\w'’.-]*){0,3}", shown, re.UNICODE):
+                recipient = shown
             else:
-                problem = ('{} is not an exact contact match. Choose who should receive it: {}.'.format(
-                    shown, ', '.join(CONTACTS)), 'recipient')
-        elif recipient != dialog['recipient']:
+                problem = ('Enter the recipient name, or choose a contact.', 'recipient')
+        if recipient is not None and recipient != dialog['recipient']:
             dialog['recipient'] = recipient
             changed.add('recipient')
     note = re.sub(r'[\x00-\x1f]', ' ', str(cmd.get('note') or '')).strip()[:60]
@@ -1047,18 +1086,27 @@ def confirm_ticket(dialog):
         'currency': g.currency,
         'amount': dialog['amount'],
         'recipient': dialog['recipient'],
+        'recipient_country': dialog.get('recipient_country', g.country),
+        'recipient_currency': dialog.get('recipient_currency', g.currency),
+        'recipient_phone_hint': dialog.get('recipient_phone_hint', ''),
         'note': dialog['note'] or '',
         'created': time.time(),
     }
     drop_pending()
     PENDING[txn['id']] = txn
     dialog['txn_id'], dialog['awaiting'] = txn['id'], 'confirm'
-    speech = 'Send {} {} to {}{}. Tap approve and use your fingerprint or face.'.format(
+    receiver = COUNTRY_MAP.get(txn['recipient_country'], {})
+    international = txn['recipient_country'] != g.country
+    speech = 'Send {} {} to {}{}{}. Tap approve and use your fingerprint or face.'.format(
         spoken_amount(txn['amount']), currency_word(), txn['recipient'],
-        (' for ' + txn['note']) if txn['note'] else '')
+        (' for ' + txn['note']) if txn['note'] else '',
+        (' in ' + receiver.get('name', txn['recipient_country']) + ' (simulation; no conversion)') if international else '')
     return jsonify(
         kind='confirm', txn_id=txn['id'], amount_text=fmt_money(txn['amount']),
         recipient=txn['recipient'], note=txn['note'], speech=speech, expects='confirm', chips=[],
+        recipient_country=txn['recipient_country'], recipient_country_name=receiver.get('name', ''),
+        recipient_currency=txn['recipient_currency'], recipient_phone_hint=txn['recipient_phone_hint'],
+        cross_border_simulated=international,
         amount_change=change_text,
         expires_in=PENDING_TTL, options=auth_options(txn),
     )
@@ -1075,7 +1123,7 @@ def identify_session():
         g.set_cookie = sid
     g.sid = sid
     g.user_id = None
-    g.country = 'GH'
+    g.country = 'IN'
     g.currency = CURRENCY
     g.phone = None
     user = user_for_auth_token(request.cookies.get('vp_auth', ''))
@@ -1111,8 +1159,12 @@ def harden(response):
     if request.is_secure:
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Content-Security-Policy'] = (
-        "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
-        "font-src https://fonts.gstatic.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        "default-src 'self'; script-src 'self' https://www.gstatic.com https://www.google.com/recaptcha/; "
+        "connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com "
+        "https://www.googleapis.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://www.gstatic.com; "
+        "frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://*.firebaseapp.com; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     )
     return response
 
@@ -1137,66 +1189,63 @@ def api_countries():
                                   precision=get_currency_precision(item['currency'])) for item in COUNTRIES])
 
 
-@app.post('/api/auth/start')
-def api_auth_start():
-    if rate_limited('phone-start', 5, 600):
-        return too_many()
-    data = request.get_json(silent=True) or {}
-    country = str(data.get('country', '')).upper()
-    phone = parsed_phone(data.get('phone', ''), country)
-    if not phone:
-        return jsonify(ok=False, error='Enter a valid phone number for the selected country.'), 400
-    phone_key = hashlib.sha256(phone.encode('ascii')).hexdigest()
-    now = time.time()
-    with LOCK:
-        recent = [stamp for stamp in PHONE_PENDING.get(phone_key, []) if now - stamp < 3600]
-        if len(recent) >= 5:
-            PHONE_PENDING[phone_key] = recent
-            return too_many()
-        recent.append(now)
-        PHONE_PENDING[phone_key] = recent
-        if len(PHONE_PENDING) > 10000:
-            PHONE_PENDING.clear()
-            PHONE_PENDING[phone_key] = recent
-    try:
-        result = twilio_verify('Verifications', {'To': phone, 'Channel': 'sms'})
-    except (RuntimeError, HTTPError, URLError, TimeoutError, ValueError) as exc:
-        app.logger.warning('Phone verification start failed: %s', type(exc).__name__)
-        return jsonify(ok=False, error='Could not send a code. Check the number or try again later.'), 502
-    if result.get('status') not in ('pending', 'approved'):
-        return jsonify(ok=False, error='Could not start phone verification. Try again.'), 502
-    return jsonify(ok=True, phone_hint=phone[-4:])
+@app.get('/api/firebase/config')
+def api_firebase_config():
+    return jsonify(configured=FIREBASE_READY, config={
+        'apiKey': FIREBASE_API_KEY, 'authDomain': FIREBASE_AUTH_DOMAIN,
+        'projectId': FIREBASE_PROJECT_ID, 'appId': FIREBASE_APP_ID,
+    } if FIREBASE_READY else None)
 
 
-@app.post('/api/auth/verify')
-def api_auth_verify():
-    if rate_limited('phone-verify', 10, 600):
+@app.post('/api/auth/firebase')
+def api_auth_firebase():
+    if rate_limited('firebase-auth', 12, 600):
         return too_many()
+    if not FIREBASE_READY:
+        return jsonify(ok=False, error='Firebase phone sign-in is not configured on this server.'), 503
     data = request.get_json(silent=True) or {}
-    country = str(data.get('country', '')).upper()
-    phone = parsed_phone(data.get('phone', ''), country)
-    code = re.sub(r'\s+', '', str(data.get('code', '')))
-    if not phone or not re.fullmatch(r'\d{4,10}', code):
-        return jsonify(ok=False, error='Enter the phone number and verification code.'), 400
+    id_token = str(data.get('id_token', ''))
+    if not id_token or len(id_token) > 12000:
+        return jsonify(ok=False, error='Firebase sign-in expired. Request a new code.'), 400
     try:
-        result = twilio_verify('VerificationCheck', {'To': phone, 'Code': code})
-    except (RuntimeError, HTTPError, URLError, TimeoutError, ValueError) as exc:
-        app.logger.warning('Phone verification check failed: %s', type(exc).__name__)
-        return jsonify(ok=False, error='Could not verify that code. Try again.'), 502
-    if result.get('status') != 'approved':
-        return jsonify(ok=False, error='That code is incorrect or expired.'), 401
+        claims = firebase_auth.verify_id_token(id_token, app=FIREBASE_APP, check_revoked=True)
+        uid = str(claims.get('uid', ''))
+        phone = str(claims.get('phone_number', ''))
+        firebase_user = firebase_auth.get_user(uid, app=FIREBASE_APP)
+        if not uid or not phone or firebase_user.phone_number != phone:
+            raise ValueError('Missing verified phone identity')
+        parsed = phonenumbers.parse(phone, None)
+        if not phonenumbers.is_valid_number(parsed):
+            raise ValueError('Invalid verified phone')
+        country = phonenumbers.region_code_for_number(parsed) or 'IN'
+    except Exception as exc:
+        app.logger.info('Firebase phone sign-in rejected: %s', type(exc).__name__)
+        return jsonify(ok=False, error='Phone verification failed or expired. Try again.'), 401
+    if country not in COUNTRY_MAP:
+        return jsonify(ok=False, error='This phone region is not supported yet.'), 400
     country_info = COUNTRY_MAP[country]
     with closing(db_connect()) as conn:
         conn.execute('BEGIN IMMEDIATE')
-        row = conn.execute('SELECT id FROM users WHERE phone=?', (phone,)).fetchone()
+        row = conn.execute('SELECT id,phone FROM users WHERE firebase_uid=?', (uid,)).fetchone()
+        phone_row = conn.execute('SELECT id,firebase_uid FROM users WHERE phone=?', (phone,)).fetchone()
+        if phone_row and phone_row['firebase_uid'] and phone_row['firebase_uid'] != uid:
+            conn.rollback()
+            return jsonify(ok=False, error='This number is linked to another account. Contact support.'), 409
         if row:
             user_id = row['id']
-            conn.execute('UPDATE users SET country=?,currency=? WHERE id=?',
-                         (country, country_info['currency'], user_id))
+            if row['phone'] != phone and phone_row and phone_row['id'] != user_id:
+                conn.rollback()
+                return jsonify(ok=False, error='This number is linked to another account. Contact support.'), 409
+            conn.execute('UPDATE users SET phone=?,country=?,currency=? WHERE id=?',
+                         (phone, country, country_info['currency'], user_id))
+        elif phone_row:
+            user_id = phone_row['id']
+            conn.execute('UPDATE users SET firebase_uid=?,country=?,currency=? WHERE id=?',
+                         (uid, country, country_info['currency'], user_id))
         else:
             user_id = str(uuid.uuid4())
-            conn.execute('INSERT INTO users(id,phone,country,currency,created) VALUES(?,?,?,?,?)',
-                         (user_id, phone, country, country_info['currency'], int(time.time())))
+            conn.execute('INSERT INTO users(id,phone,country,currency,firebase_uid,created) VALUES(?,?,?,?,?,?)',
+                         (user_id, phone, country, country_info['currency'], uid, int(time.time())))
         conn.commit()
     ensure_user_ledger(user_id, country_info['currency'])
     if g.user_id and g.user_id != user_id:
@@ -1299,12 +1348,39 @@ def _api_chat():
         return too_many()
     data = request.get_json(silent=True) or {}
     text = str(data.get('text', '')).strip()[:300]
+    requested_destination = str(data.get('recipient_country') or g.country).upper()
+    recipient_phone_hint = ''
+    # Contact Picker may provide a phone number. Use it only to infer a destination
+    # region, then discard it; this simulation does not retain contact numbers.
+    contact_phone = str(data.get('recipient_phone') or '').strip()
+    if contact_phone:
+        try:
+            parsed_recipient_phone = phonenumbers.parse(contact_phone, None)
+            if not phonenumbers.is_valid_number(parsed_recipient_phone):
+                raise ValueError('invalid contact number')
+            inferred_region = phonenumbers.region_code_for_number(parsed_recipient_phone)
+            if inferred_region in COUNTRY_MAP:
+                requested_destination = inferred_region
+            recipient_phone_hint = phonenumbers.format_number(
+                parsed_recipient_phone, phonenumbers.PhoneNumberFormat.E164)[-4:]
+        except (phonenumbers.NumberParseException, ValueError):
+            return jsonify(ok=False, error='That contact does not have a valid phone number.'), 400
+    if requested_destination not in COUNTRY_MAP:
+        return jsonify(ok=False, error='Choose a supported destination country.'), 400
     if not text:
-        return message('Tell me what you would like to do, for example: send 50 to Kofi for lunch.')
+        return message('Tell me what you would like to do, for example: send 500 rupees to Priya for lunch.')
 
     with LOCK:
         purge_pending()
         dialog = get_dialog()
+        if dialog.get('recipient_country') != requested_destination:
+            drop_pending()
+            dialog['recipient_country'] = requested_destination
+            dialog['recipient_currency'] = COUNTRY_MAP[requested_destination]['currency']
+            dialog['recipient_phone_hint'] = ''
+            dialog['txn_id'] = None
+        if recipient_phone_hint:
+            dialog['recipient_phone_hint'] = recipient_phone_hint
         if dialog['awaiting'] == 'confirm' and dialog['txn_id'] not in PENDING:
             dialog['awaiting'], dialog['txn_id'] = None, None  # the ticket expired
     cmd, source = understand(text, dialog)  # may call the AI: done outside the lock
@@ -1335,7 +1411,7 @@ def _api_chat():
             if in_flow:
                 return next_question(dialog, "Sorry, I did not catch that. ")
             return message(
-                'I can send money to your contacts. Try: send 50 to Kofi for lunch. '
+                'I can prepare a payment. Try: send 500 rupees to Priya for lunch. '
                 'Your balance is private; ask for it and confirm with Face ID / Touch ID.',
                 source=source, expects=None, chips=[])
 
@@ -1407,7 +1483,7 @@ def api_health_details():
             info['groq_test'] = {'ok': False, 'error': 'GROQ_API_KEY is not set on the server.'}
         else:
             try:
-                info['groq_test'] = {'ok': True, 'understood': llm_parse('send fifty cedis to Kofi for lunch')}
+                info['groq_test'] = {'ok': True, 'understood': llm_parse('send five hundred rupees to Aarav for lunch')}
             except Exception as exc:
                 info['groq_test'] = {'ok': False, 'error': str(exc)}
     return jsonify(info)
@@ -1527,10 +1603,11 @@ def api_approve():
                 reset_dialog()
                 return jsonify(ok=False, expired=True, error='The payment could not be approved under today’s limits.'), 400
             created = int(time.time())
-            conn.execute('''INSERT INTO ledger(kind,amount_cents,recipient,note,created,idempotency_key,session_id,owner_id,currency)
-                            VALUES('payment',?,?,?,?,?,?,?,?)''',
+            conn.execute('''INSERT INTO ledger(kind,amount_cents,recipient,note,created,idempotency_key,session_id,
+                            owner_id,currency,recipient_country,recipient_currency)
+                            VALUES('payment',?,?,?,?,?,?,?,?,?,?)''',
                          (-amount_cents, txn['recipient'], txn['note'], created, txn_id, g.sid,
-                          g.user_id, g.currency))
+                          g.user_id, g.currency, txn.get('recipient_country'), txn.get('recipient_currency')))
             conn.commit()
         except sqlite3.IntegrityError:
             conn.rollback()
@@ -1543,7 +1620,10 @@ def api_approve():
             conn.close()
         del PENDING[txn_id]
         record = {'to': txn['recipient'], 'amount': txn['amount'], 'note': txn['note'],
-                  'time': created, 'reference': txn_id}
+                  'time': created, 'reference': txn_id, 'currency': txn['currency'],
+                  'recipient_country': txn.get('recipient_country'),
+                  'recipient_currency': txn.get('recipient_currency'),
+                  'recipient_phone_hint': txn.get('recipient_phone_hint', '')}
         DIALOGS.pop(g.sid, None)
 
     return jsonify(ok=True, record=record)  # balance remains private

@@ -28,7 +28,7 @@ if sys.version_info < (3, 9):
     bad('Python 3.9 or newer is required.')
 
 print('\nLibraries')
-for package in ('flask', 'openai', 'webauthn', 'Babel', 'phonenumbers'):
+for package in ('flask', 'openai', 'webauthn', 'Babel', 'phonenumbers', 'firebase-admin'):
     try:
         ok('{} {}'.format(package, metadata.version(package)))
     except metadata.PackageNotFoundError:
@@ -122,8 +122,8 @@ print('\nApp')
 try:
     import app as voicepay
 
-    cmd, source = voicepay.fallback_parse('pay Ama thirty cedis for lunch'), 'rules'
-    if cmd.get('amount') == 30.0 and cmd.get('recipient') == 'Ama':
+    cmd, source = voicepay.fallback_parse('pay thirty rupees to Aarav for lunch'), 'rules'
+    if cmd.get('amount') == 30.0 and cmd.get('recipient') == 'Aarav':
         ok('app.py loads and the rule-based parser works')
     else:
         bad('rule-based parser returned {}'.format(cmd))
@@ -132,11 +132,18 @@ except Exception as exc:
     voicepay = None
 
 if voicepay is not None:
-    twilio = (voicepay.TWILIO_ACCOUNT_SID, voicepay.TWILIO_AUTH_TOKEN, voicepay.TWILIO_VERIFY_SERVICE_SID)
-    if all(twilio):
-        ok('Twilio Verify is configured for phone sign-in')
+    firebase_client = (voicepay.FIREBASE_API_KEY, voicepay.FIREBASE_AUTH_DOMAIN,
+                       voicepay.FIREBASE_PROJECT_ID, voicepay.FIREBASE_APP_ID)
+    if all(firebase_client):
+        ok('Firebase Web app config is set')
     else:
-        bad('Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_VERIFY_SERVICE_SID before phone sign-in.')
+        bad('Set FIREBASE_API_KEY, FIREBASE_AUTH_DOMAIN, FIREBASE_PROJECT_ID and FIREBASE_APP_ID.')
+    if voicepay.FIREBASE_READY:
+        ok('Firebase Admin credentials are ready for verified phone tokens')
+    elif not voicepay.FIREBASE_SERVICE_ACCOUNT_JSON and not os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
+        bad('Set FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS for the server Admin SDK.')
+    else:
+        bad('Firebase Admin could not initialize. Check the service account credentials.')
     if voicepay.SETUP_TOKEN:
         ok('SETUP_TOKEN is set for owner-only diagnostics')
     else:
@@ -152,8 +159,8 @@ if '--live' in sys.argv and voicepay is not None:
         bad('Skipped: GROQ_API_KEY is not set.')
     else:
         try:
-            cmd = voicepay.llm_parse('send fifty cedis to Kofi for lunch')
-            if str(cmd.get('recipient', '')).lower() == 'kofi' and voicepay.to_amount(cmd.get('amount')) == 50.0:
+            cmd = voicepay.llm_parse('send five hundred rupees to Aarav for lunch')
+            if str(cmd.get('recipient', '')).lower() == 'aarav' and voicepay.to_amount(cmd.get('amount')) == 500.0:
                 ok('Groq understood the command: {}'.format(cmd))
             else:
                 bad('Groq replied, but not as expected: {}'.format(cmd))
