@@ -108,7 +108,9 @@ async function apiUpload(path, form) {
 async function initializeFirebase() {
   if (firebaseAuth && firebaseModules) return firebaseModules;
   const response = await api('/api/firebase/config');
-  if (!response.configured || !response.config) throw new Error('Phone sign-in is not configured yet.');
+  if (!response.configured || !response.config) {
+    throw new Error('Phone sign-in needs Firebase Web settings and the private Firebase Admin service account in the server environment.');
+  }
   const root = 'https://www.gstatic.com/firebasejs/13.2.0/';
   const [appSdk, authSdk] = await Promise.all([
     import(root + 'firebase-app.js'), import(root + 'firebase-auth.js'),
@@ -157,7 +159,8 @@ const VIEWS = ['home', 'about', 'pay', 'balance', 'history', 'setup', 'settings'
 
 function navigate(view, push) {
   if (!VIEWS.includes(view)) view = 'home';
-  if (!app.authenticated && ['pay', 'balance', 'history', 'setup', 'settings'].includes(view)) view = 'account';
+  const requiresAccount = !app.authenticated && ['pay', 'balance', 'history', 'setup', 'settings'].includes(view);
+  if (requiresAccount) view = 'account';
   if (view !== 'balance') hideBalance();
   if (view !== 'history') hideHistory();
   document.querySelectorAll('[data-screen]').forEach((screen) => {
@@ -173,6 +176,7 @@ function navigate(view, push) {
   if (push !== false && location.hash !== '#' + view) history.pushState({ view }, '', '#' + view);
   if (view === 'balance') prefetchReveal();
   if (view === 'history') prefetchHistory();
+  if (requiresAccount) say('Verify your phone number to open this section.', 'error');
 }
 
 function clearClientFlow() {
@@ -418,7 +422,17 @@ async function sendPhoneCode() {
     say('Code sent. Check your text messages.', 'ok');
   } catch (e) {
     if (firebaseRecaptcha) { try { await firebaseRecaptcha.clear(); } catch (ignored) {} firebaseRecaptcha = null; }
-    say(e.message || 'Could not send a code. Check the number and try again.', 'error');
+    const code = e.code || '';
+    const messages = {
+      'auth/invalid-phone-number': 'Check the phone number and country code, then try again.',
+      'auth/too-many-requests': 'Too many attempts. Wait a while before requesting another code.',
+      'auth/operation-not-allowed': 'Phone sign-in is disabled in Firebase Console.',
+      'auth/unauthorized-domain': 'Add this site hostname to Firebase Authentication’s Authorized domains.',
+      'auth/captcha-check-failed': 'Phone verification could not confirm this browser. Refresh and try again.',
+      'auth/quota-exceeded': 'Firebase SMS quota is reached. Try later or check the project billing settings.',
+      'auth/network-request-failed': 'Could not reach Firebase. Check your connection and try again.',
+    };
+    say(messages[code] || e.message || 'Could not send a code. Check the number and try again.', 'error');
   }
   finally { $('send-code').disabled = false; }
 }

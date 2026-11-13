@@ -43,7 +43,13 @@ import phonenumbers
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials as firebase_credentials
 from babel import Locale
-from babel.numbers import format_currency, get_currency_name, get_currency_precision, get_territory_currencies
+from babel.numbers import (
+    format_currency,
+    get_currency_name,
+    get_currency_precision,
+    get_currency_symbol,
+    get_territory_currencies,
+)
 
 try:  # optional: read settings from a .env file next to this script
     from dotenv import load_dotenv
@@ -1161,9 +1167,11 @@ def harden(response):
     response.headers['Content-Security-Policy'] = (
         "default-src 'self'; script-src 'self' https://www.gstatic.com https://www.google.com/recaptcha/; "
         "connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com "
-        "https://www.googleapis.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "https://www.googleapis.com https://www.google.com https://www.recaptcha.net; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://www.gstatic.com; "
-        "frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://*.firebaseapp.com; "
+        "frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ "
+        "https://www.recaptcha.net/recaptcha/ https://*.firebaseapp.com; "
         "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     )
     return response
