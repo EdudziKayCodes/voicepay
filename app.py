@@ -377,7 +377,7 @@ def country_catalog():
         name = territories.get(region)
         if not dial or not name:
             continue
-        currencies = get_territory_currencies(region, tender=True, date=today)
+        currencies = get_territory_currencies(region, start_date=today, tender=True)
         if not currencies:
             currencies = get_territory_currencies(region, tender=True)
         if not currencies:
