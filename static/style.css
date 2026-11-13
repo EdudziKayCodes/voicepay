@@ -100,3 +100,24 @@ h1 em { color: var(--gold); font-style: normal; }
 .transfer-options { display:flex; align-items:center; gap:8px; padding:4px 0 8px; color:var(--muted); font-size:11px; }
 .transfer-options select { min-width:0; max-width:55%; padding:7px 9px; border:1px solid var(--line); border-radius:8px; background:#071426; color:var(--text); }
 .transfer-options .text-link { margin-left:auto; white-space:nowrap; font-size:11px; }
+.method-row { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:0 0 7px; padding:6px 9px; border:1px solid var(--line); border-radius:8px; color:var(--muted); font-size:10px; }
+.method-row button { padding:5px 9px; border:1px solid var(--line); border-radius:20px; color:var(--gold); background:#e8bf6810; font-size:10px; }
+.method-row button:disabled { cursor:not-allowed; opacity:.8; }
+.recipient-phone-label { margin:0 6px 0 0; color:var(--muted); font-size:10px; }
+.recipient-phone { width:calc(100% - 142px); min-width:130px; padding:7px 9px; border:1px solid var(--line); border-radius:8px; background:#071426; }
+.voice-check { margin:12px 0; padding:11px; border:1px solid var(--line); border-radius:9px; background:#071426; text-align:center; }
+.voice-check p { margin:0 0 6px; color:var(--muted); font-size:11px; }
+.voice-check strong { display:block; margin-bottom:8px; color:var(--gold-light); letter-spacing:1px; }
+.voice-check button { width:100%; }
+@media (max-width:700px) {
+  html, body { height:auto; min-height:100%; overflow-x:hidden; overflow-y:auto; }
+  .app-shell { height:100svh; min-height:620px; }
+  .screen { overflow-y:auto; overscroll-behavior:contain; }
+  .pay-screen { overflow:visible; }
+  .pay-layout { min-height:510px; height:auto; grid-template-rows:minmax(260px, 1fr) auto; }
+  .conversation-panel { min-height:0; }
+  .log { min-height:120px; }
+  .payment-aside:has(#ticket:not([hidden])), .payment-aside:has(#receipt:not([hidden])) { max-height:85svh; overflow-y:auto; }
+  .transfer-options { flex-wrap:wrap; }
+  .recipient-phone { width:100%; }
+}

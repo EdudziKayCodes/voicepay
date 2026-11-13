@@ -51,6 +51,11 @@ const app = {
   lastPayment: null,
   recentContacts: [],
   selectedContact: null,
+  inactivityTimer: null,
+  lastActivity: Date.now(),
+  voicePhrase: [],
+  voicePhraseAttempts: 0,
+  voicePhrasePassed: false,
 };
 
 /* ---------- helpers ---------- */
@@ -252,7 +257,8 @@ function speak(text) {
       u.rate = 0.96;
       const voices = window.speechSynthesis.getVoices();
       const wanted = LANG.toLowerCase();
-      u.voice = voices.find((voice) => voice.lang.toLowerCase() === wanted)
+      const preferred = wanted === 'en-gh' ? ['en-gh', 'en-gb', 'en-us'] : [wanted];
+      u.voice = voices.find((voice) => preferred.includes(voice.lang.toLowerCase()))
         || voices.find((voice) => voice.lang.toLowerCase().startsWith(wanted.split('-')[0]))
         || null;
       u.onend = resolve;
@@ -274,6 +280,12 @@ async function botSay(text, expects, isError) {
 async function handleCommand(text, shown) {
   text = (text || '').trim();
   if (!text || app.busy) return;
+  stopVoiceInput();
+  const manualPhone = $('recipient-phone').value.trim();
+  if (manualPhone && !app.selectedContact && !/\bto\b/i.test(text)) {
+    const tail = manualPhone.replace(/\D/g, '').slice(-4);
+    text += ' to phone ending ' + tail;
+  }
   if (/\b(cancel|stop|abort|never\s?mind)\b/i.test(text)) app.selectedContact = null;
   app.busy = true;
   addMessage('you', shown || text);
@@ -283,7 +295,7 @@ async function handleCommand(text, shown) {
     const r = await api('/api/chat', {
       text,
       recipient_country: $('recipient-country').value || app.country,
-      recipient_phone: app.selectedContact ? app.selectedContact.phone : '',
+      recipient_phone: app.selectedContact ? app.selectedContact.phone : $('recipient-phone').value.trim(),
     });
     navigate('pay');
     if (r.source) $('engine').textContent = r.source === 'ai' ? 'Enhanced command understanding' : 'Basic command understanding';
@@ -291,6 +303,7 @@ async function handleCommand(text, shown) {
       showTicket(r);
       app.busy = false;
       await botSay('Check the details, then approve. ' + r.speech, 'confirm');
+      if (app.sound) await speak('Voice phrase simulation. Say: ' + app.voicePhrase.join(', '));
       return;
     }
     if (r.expects !== 'confirm') hideTicket();
@@ -455,6 +468,7 @@ async function verifyPhoneCode() {
 }
 
 async function logout() {
+  if (app.inactivityTimer) { clearTimeout(app.inactivityTimer); app.inactivityTimer = null; }
   if (firebaseAuth && firebaseModules) { try { await firebaseModules.signOut(firebaseAuth); } catch (e) { /* clear server session below */ } }
   try { await api('/api/auth/logout', {}); } catch (e) { /* still clear the local view */ }
   firebaseSyncUid = null;
@@ -485,6 +499,7 @@ async function pickContact() {
     const phone = contact && contact.tel && contact.tel[0];
     if (!name) { say('That contact has no name. Type the recipient instead.', 'error'); return; }
     app.selectedContact = phone ? { name, phone: phoneToE164(phone, $('recipient-country').value || app.country) } : null;
+    $('recipient-phone').value = app.selectedContact ? app.selectedContact.phone : '';
     handleCommand('send to ' + name, 'Contact: ' + name);
   } catch (e) {
     if (e.name !== 'AbortError') say('Could not read that contact. Type the recipient name instead.', 'error');
@@ -858,14 +873,15 @@ function cleanupRecording() {
 function queueVoiceTranscript(transcript) {
   if (app.voiceTimer) clearTimeout(app.voiceTimer);
   $('typed').value = transcript;
-  say('Heard: “' + transcript + '”. Edit it or press Send; sending in 2 seconds.');
+  say('Heard: “' + transcript + '”. Edit or send in 3 seconds.');
   app.voiceTimer = setTimeout(() => {
     app.voiceTimer = null;
     if ($('typed').value.trim() === transcript) {
+      stopVoiceInput();
       $('typed').value = '';
       handleCommand(transcript);
     }
-  }, 2000);
+  }, 3000);
 }
 
 function onTranscriptEdit() {
@@ -877,6 +893,39 @@ function onTranscriptEdit() {
 }
 
 /* ---------- confirmation ticket and approval ---------- */
+
+function prepareVoicePhrase() {
+  const words = ['amber','apple','bridge','candle','cedar','cloud','daisy','delta','eagle','ember','forest','garden','harbor','island','jacket','lemon','maple','meadow','ocean','olive','pencil','planet','rabbit','river','silver','sunset','tiger','velvet','window','yellow'];
+  app.voicePhrase = Array.from({ length: 3 }, () => words[Math.floor(Math.random() * words.length)]);
+  app.voicePhraseAttempts = 0;
+  app.voicePhrasePassed = false;
+  $('voice-words').textContent = app.voicePhrase.join(' · ');
+  $('approve').disabled = true;
+}
+
+async function runVoicePhraseCheck() {
+  if (!Recognition) { say('Voice phrase check is unsupported in this browser.', 'error'); return; }
+  const rec = new Recognition();
+  rec.lang = LANG; rec.interimResults = false; rec.maxAlternatives = 1;
+  $('voice-check').disabled = true; say('Listening for the three words.');
+  rec.onresult = async (event) => {
+    const said = event.results[0][0].transcript.toLowerCase().replace(/[^a-z ]/g, ' ').trim().split(/\s+/).join(' ');
+    if (said === app.voicePhrase.join(' ')) {
+      app.voicePhrasePassed = true; $('approve').disabled = false;
+      say('Phrase matched. Continue with device approval.', 'ok');
+    } else if (++app.voicePhraseAttempts >= 2) {
+      hideTicket(); try { await api('/api/cancel', {}); } catch (e) {}
+      addMessage('bot', 'Voice phrase did not match twice. Payment cancelled.');
+      say('Payment cancelled after two phrase mismatches.', 'error');
+    } else {
+      const attempts = app.voicePhraseAttempts; prepareVoicePhrase(); app.voicePhraseAttempts = attempts;
+      say('Phrase did not match. New words are ready; try once more.', 'error');
+    }
+  };
+  rec.onerror = () => say('Could not hear the phrase. Try again.', 'error');
+  rec.onend = () => { $('voice-check').disabled = false; };
+  try { rec.start(); } catch (e) { $('voice-check').disabled = false; say('Could not start voice recognition.', 'error'); }
+}
 
 function hideTicket() {
   $('ticket').hidden = true;
@@ -904,6 +953,7 @@ function showTicket(r) {
   $('t-change').hidden = !r.amount_change;
   $('approve').disabled = false;
   $('ticket').hidden = false;
+  prepareVoicePhrase();
   $('ticket-announcement').textContent = 'Review payment: ' + r.amount_text + ' to ' + r.recipient
     + (r.recipient_phone_hint ? ', phone ending ' + r.recipient_phone_hint : '')
     + (r.note ? ', for ' + r.note : '') + (route ? '. ' + route : '') + '. This is simulated.';
@@ -926,6 +976,7 @@ function tick() {
 async function onApprove() {
   const txn = app.txn;
   if (!txn || app.approving) return;
+  if (!app.voicePhrasePassed) { say('Complete the three-word voice phrase check first.', 'error'); return; }
   if (!canUseBiometrics()) {
     say('Face ID / Touch ID needs https or localhost.', 'error');
     return;
@@ -960,6 +1011,7 @@ async function onApprove() {
 }
 
 function completeReceipt(record) {
+  stopVoiceInput();
   hideTicket();
   $('receipt-text').textContent = formatMoney(record.amount) + ' to ' + record.to
     + (record.note ? ' for ' + record.note : '');
@@ -980,15 +1032,28 @@ function completeReceipt(record) {
   refresh();
 }
 
-function onRepeatLastPayment() {
-  const payment = app.lastPayment;
-  if (!payment) return;
-  $('recipient-country').value = payment.recipient_country && payment.recipient_country !== app.country
-    ? payment.recipient_country : '';
-  const command = 'send ' + Number(payment.amount).toFixed(2) + ' to ' + payment.to
-    + (payment.note ? ' for ' + payment.note : '');
+function stopVoiceInput() {
+  if (app.voiceTimer) { clearTimeout(app.voiceTimer); app.voiceTimer = null; }
+  if (app.recognizer && app.listening) { try { app.recognizer.abort(); } catch (e) {} }
+  if (app.mediaRecorder && app.recording) { app.mediaRecorder.onstop = null; try { app.mediaRecorder.stop(); } catch (e) {} }
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+  cleanupRecording();
+  setListening(false);
+}
+
+function clearReceiptAndChat() {
+  stopVoiceInput();
   $('receipt').hidden = true;
-  handleCommand(command, 'Prepare again: ' + formatMoney(payment.amount) + ' to ' + payment.to);
+  $('pay-tip').hidden = false;
+  $('typed').value = '';
+  $('recipient-phone').value = '';
+  $('log').textContent = '';
+  app.lastPayment = null;
+  app.txn = null;
+  app.selectedContact = null;
+  setChips(startChips());
+  addMessage('bot', 'Ready for a new payment.');
+  say('Receipt dismissed. The completed demo payment remains in Activity.', 'ok');
 }
 
 async function onCancel() {
@@ -1058,10 +1123,11 @@ async function start() {
   $('setup-scan').addEventListener('click', scanSetup);
   $('approve').addEventListener('click', onApprove);
   $('cancel').addEventListener('click', onCancel);
+  $('voice-check').addEventListener('click', runVoicePhraseCheck);
   $('reveal').addEventListener('click', onReveal);
   $('history-reveal').addEventListener('click', onHistoryReveal);
   $('reset').addEventListener('click', onReset);
-  $('repeat-payment').addEventListener('click', onRepeatLastPayment);
+  $('clear-receipt').addEventListener('click', clearReceiptAndChat);
   $('sound').addEventListener('click', onSound);
   $('sound-setting').addEventListener('click', onSound);
   $('add-device').addEventListener('click', () => {
@@ -1072,11 +1138,23 @@ async function start() {
   });
   $('country-select').addEventListener('change', updateCurrencyPreview);
   $('recipient-country').addEventListener('change', () => { app.selectedContact = null; });
+  $('recipient-phone').addEventListener('input', () => { app.selectedContact = null; });
   $('pick-contact').addEventListener('click', pickContact);
   $('send-code').addEventListener('click', sendPhoneCode);
   $('verify-code').addEventListener('click', verifyPhoneCode);
   $('logout').addEventListener('click', logout);
   $('logout-settings').addEventListener('click', logout);
+  const resetInactivity = () => {
+    app.lastActivity = Date.now();
+    if (app.inactivityTimer) clearTimeout(app.inactivityTimer);
+    app.inactivityTimer = setTimeout(() => {
+      if (app.authenticated) { say('Signed out after 5 minutes of inactivity.', 'error'); logout(); }
+    }, 5 * 60 * 1000);
+  };
+  ['pointerdown', 'keydown', 'touchstart', 'input'].forEach((eventName) =>
+    document.addEventListener(eventName, resetInactivity, { passive: true }));
+  window.addEventListener('focus', resetInactivity);
+  resetInactivity();
   $('sound').textContent = '♫';
   $('sound').setAttribute('aria-pressed', 'false');
   $('language').value = LANG;

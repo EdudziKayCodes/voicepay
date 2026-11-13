@@ -59,6 +59,8 @@
       <div class="pay-layout">
         <div class="conversation-panel">
       <div class="transfer-options"><label for="recipient-country">Destination</label><select id="recipient-country" aria-label="Destination country"><option value="">Same as my country</option></select><button id="pick-contact" class="text-link" type="button">Choose a contact</button></div>
+      <div class="method-row"><span>Bank transfer · PayPal · Paystack</span><button type="button" disabled aria-disabled="true">Coming soon</button></div>
+      <label class="recipient-phone-label" for="recipient-phone">Recipient phone (optional)</label><input id="recipient-phone" class="recipient-phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+country code and number">
       <div class="contact-shortcuts" id="chips"></div>
           <ol id="log" class="log" aria-live="polite"></ol>
           <div class="compose-wrap">
@@ -77,11 +79,12 @@
             <p id="t-to" class="ticket-to"></p><p id="t-route" class="ticket-note" hidden></p><p id="t-note" class="ticket-note"></p><p id="t-change" class="ticket-change" hidden></p>
             <div class="ticket-divider"></div>
             <p class="ticket-safe">Check these details before approving.</p>
+            <div class="voice-check"><p>Voice phrase simulation: say these words</p><strong id="voice-words"></strong><button id="voice-check" class="outline-button" type="button">Confirm voice phrase</button></div>
             <div class="ticket-actions"><button id="approve" class="gold-button" type="button">Approve with biometrics</button><button id="cancel" class="outline-button" type="button">Cancel</button></div>
             <p id="t-timer" class="timer" aria-live="off"></p>
           </div>
           <section id="receipt" class="aside-card receipt" role="status" aria-live="polite" hidden>
-            <div class="success-mark">✓</div><p class="eyebrow">PAYMENT COMPLETE</p><h2 id="receipt-text"></h2><p id="receipt-reference" class="receipt-reference"></p><button id="repeat-payment" class="outline-button" type="button">Repeat payment</button>
+            <div class="success-mark">✓</div><p class="eyebrow">PAYMENT COMPLETE</p><h2 id="receipt-text"></h2><p id="receipt-reference" class="receipt-reference"></p><button id="clear-receipt" class="outline-button" type="button">Done · clear screen</button>
           </section>
           <div class="aside-card tip-card" id="pay-tip"><span class="tip-icon">✦</span><h2>Every payment is yours to approve.</h2><p>VoicePay prepares the details. Your device confirms the action.</p></div>
         </aside>
@@ -135,7 +138,7 @@
 
     <section class="screen" id="screen-settings" data-screen="settings" aria-labelledby="settings-title" hidden>
       <div class="screen-heading"><div><p class="eyebrow">PREFERENCES</p><h1 id="settings-title">Settings</h1></div><button class="tiny-action" type="button" data-view="home" aria-label="Back home">×</button></div>
-      <div class="settings-panel"><div class="setting-row"><span>Voice replies</span><button id="sound-setting" class="toggle" type="button" aria-pressed="false" aria-label="Toggle voice replies"><i></i></button></div><label class="setting-row" for="language"><span>Speech language</span><select id="language"><option value="en-IN">English · India</option><option value="en-US">English · US</option><option value="en-GB">English · UK</option></select></label><p class="screen-footnote">The microphone is always optional.</p></div>
+      <div class="settings-panel"><div class="setting-row"><span>Voice replies</span><button id="sound-setting" class="toggle" type="button" aria-pressed="false" aria-label="Toggle voice replies"><i></i></button></div><label class="setting-row" for="language"><span>Speech language</span><select id="language"><option value="en-IN">English · India</option><option value="en-US">English · US</option><option value="en-GB">English · UK</option><option value="en-GH">English · Ghana</option></select></label><p class="screen-footnote">Voice phrase checks are a simulation, not speaker identity. Device approval remains required. The microphone is optional.</p></div>
       <button id="reset" class="text-link reset-link" type="button">Reset demo</button>
       <button id="logout-settings" class="text-link reset-link" type="button">Sign out</button>
     </section>

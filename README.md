@@ -19,6 +19,15 @@ The interface has separate Home, Pay, Balance, Activity, Device Security, and Se
 and Activity hide again when you leave their screens. The opening view introduces the demo before a
 visitor starts a payment.
 
+The pay screen accepts a recipient name and an optional international phone number; browser contact
+selection is available where supported, with manual entry as fallback. A completed receipt can be
+dismissed to clear the chat while preserving the simulated payment in Activity. Voice transcripts are
+sent after a three-second pause. Signed-in sessions log out after five minutes without interface
+activity. Bank transfer, PayPal, and Paystack are shown as locked Coming soon options; no payment
+provider integration exists. A three-word spoken phrase is an optional demo challenge, not speaker
+recognition or identity proof. Face ID, Touch ID, or device screen-lock verification is still required.
+Ghanaian English voice output requests an `en-GH` system voice and falls back where the device lacks it.
+
 ## 1. Install (5 minutes)
 
 ```
