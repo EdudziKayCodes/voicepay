@@ -8,6 +8,10 @@
 const $ = (id) => document.getElementById(id);
 const HIDDEN_BALANCE = '\u2022\u2022\u2022\u2022\u2022\u2022';
 
+function savedPhrasePreference() {
+  try { return localStorage.getItem('voicepay-phrase-check') === 'on'; } catch (e) { return false; }
+}
+
 let LANG = 'en-IN';
 let countryCatalog = [];
 let firebaseAuth = null;
@@ -56,6 +60,7 @@ const app = {
   voicePhrase: [],
   voicePhraseAttempts: 0,
   voicePhrasePassed: false,
+  voicePhraseEnabled: savedPhrasePreference(),
 };
 
 /* ---------- helpers ---------- */
@@ -895,36 +900,43 @@ function onTranscriptEdit() {
 /* ---------- confirmation ticket and approval ---------- */
 
 function prepareVoicePhrase() {
+  $('voice-check-panel').hidden = !app.voicePhraseEnabled;
   const words = ['amber','apple','bridge','candle','cedar','cloud','daisy','delta','eagle','ember','forest','garden','harbor','island','jacket','lemon','maple','meadow','ocean','olive','pencil','planet','rabbit','river','silver','sunset','tiger','velvet','window','yellow'];
-  app.voicePhrase = Array.from({ length: 3 }, () => words[Math.floor(Math.random() * words.length)]);
+  const pool = words.slice();
+  app.voicePhrase = Array.from({ length: 3 }, () => pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
   app.voicePhraseAttempts = 0;
   app.voicePhrasePassed = false;
   $('voice-words').textContent = app.voicePhrase.join(' · ');
-  $('approve').disabled = true;
+  $('approve').disabled = app.voicePhraseEnabled;
 }
 
 async function runVoicePhraseCheck() {
-  if (!Recognition) { say('Voice phrase check is unsupported in this browser.', 'error'); return; }
+  if (!Recognition) { say('Voice recognition is unavailable. Type the three displayed words below.', 'error'); $('voice-phrase-input').focus(); return; }
   const rec = new Recognition();
   rec.lang = LANG; rec.interimResults = false; rec.maxAlternatives = 1;
   $('voice-check').disabled = true; say('Listening for the three words.');
   rec.onresult = async (event) => {
     const said = event.results[0][0].transcript.toLowerCase().replace(/[^a-z ]/g, ' ').trim().split(/\s+/).join(' ');
-    if (said === app.voicePhrase.join(' ')) {
-      app.voicePhrasePassed = true; $('approve').disabled = false;
-      say('Phrase matched. Continue with device approval.', 'ok');
-    } else if (++app.voicePhraseAttempts >= 2) {
+    processVoicePhrase(said);
+  };
+  rec.onerror = () => { $('voice-check').disabled = false; say('Could not hear the phrase. Try again or type the displayed words.', 'error'); };
+  rec.onend = () => { $('voice-check').disabled = false; };
+  try { rec.start(); } catch (e) { $('voice-check').disabled = false; say('Could not start voice recognition. Type the displayed words instead.', 'error'); }
+}
+
+async function processVoicePhrase(value) {
+  const said = String(value || '').toLowerCase().replace(/[^a-z ]/g, ' ').trim().split(/\s+/).join(' ');
+  if (said === app.voicePhrase.join(' ')) {
+    app.voicePhrasePassed = true; $('approve').disabled = false;
+    say('Phrase matched. Continue with device approval.', 'ok');
+  } else if (++app.voicePhraseAttempts >= 2) {
       hideTicket(); try { await api('/api/cancel', {}); } catch (e) {}
       addMessage('bot', 'Voice phrase did not match twice. Payment cancelled.');
       say('Payment cancelled after two phrase mismatches.', 'error');
-    } else {
-      const attempts = app.voicePhraseAttempts; prepareVoicePhrase(); app.voicePhraseAttempts = attempts;
-      say('Phrase did not match. New words are ready; try once more.', 'error');
-    }
-  };
-  rec.onerror = () => say('Could not hear the phrase. Try again.', 'error');
-  rec.onend = () => { $('voice-check').disabled = false; };
-  try { rec.start(); } catch (e) { $('voice-check').disabled = false; say('Could not start voice recognition.', 'error'); }
+  } else {
+    const attempts = app.voicePhraseAttempts; prepareVoicePhrase(); app.voicePhraseAttempts = attempts;
+    say('Phrase did not match. New words are ready; try once more.', 'error');
+  }
 }
 
 function hideTicket() {
@@ -976,7 +988,7 @@ function tick() {
 async function onApprove() {
   const txn = app.txn;
   if (!txn || app.approving) return;
-  if (!app.voicePhrasePassed) { say('Complete the three-word voice phrase check first.', 'error'); return; }
+  if (app.voicePhraseEnabled && !app.voicePhrasePassed) { say('Complete the optional three-word phrase check first.', 'error'); return; }
   if (!canUseBiometrics()) {
     say('Face ID / Touch ID needs https or localhost.', 'error');
     return;
@@ -1124,6 +1136,18 @@ async function start() {
   $('approve').addEventListener('click', onApprove);
   $('cancel').addEventListener('click', onCancel);
   $('voice-check').addEventListener('click', runVoicePhraseCheck);
+  $('voice-phrase-submit').addEventListener('click', () => {
+    const input = $('voice-phrase-input');
+    const value = input.value;
+    input.value = '';
+    processVoicePhrase(value);
+  });
+  $('voice-phrase-enabled').checked = app.voicePhraseEnabled;
+  $('voice-phrase-enabled').addEventListener('change', (event) => {
+    app.voicePhraseEnabled = event.target.checked;
+    try { localStorage.setItem('voicepay-phrase-check', app.voicePhraseEnabled ? 'on' : 'off'); } catch (e) {}
+    say(app.voicePhraseEnabled ? 'Optional phrase check enabled. Device approval is still required.' : 'Face ID / Touch ID is the default approval.', 'ok');
+  });
   $('reveal').addEventListener('click', onReveal);
   $('history-reveal').addEventListener('click', onHistoryReveal);
   $('reset').addEventListener('click', onReset);

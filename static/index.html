@@ -79,7 +79,7 @@
             <p id="t-to" class="ticket-to"></p><p id="t-route" class="ticket-note" hidden></p><p id="t-note" class="ticket-note"></p><p id="t-change" class="ticket-change" hidden></p>
             <div class="ticket-divider"></div>
             <p class="ticket-safe">Check these details before approving.</p>
-            <div class="voice-check"><p>Voice phrase simulation: say these words</p><strong id="voice-words"></strong><button id="voice-check" class="outline-button" type="button">Confirm voice phrase</button></div>
+            <div class="voice-check" id="voice-check-panel" hidden><p>Optional spoken phrase simulation</p><strong id="voice-words"></strong><button id="voice-check" class="outline-button" type="button">Confirm by voice</button><label for="voice-phrase-input">If voice recognition is unavailable, type the words</label><input id="voice-phrase-input" autocomplete="off" aria-label="Type the three demo words"><button id="voice-phrase-submit" class="text-link" type="button">Check typed phrase</button></div>
             <div class="ticket-actions"><button id="approve" class="gold-button" type="button">Approve with biometrics</button><button id="cancel" class="outline-button" type="button">Cancel</button></div>
             <p id="t-timer" class="timer" aria-live="off"></p>
           </div>
@@ -138,7 +138,7 @@
 
     <section class="screen" id="screen-settings" data-screen="settings" aria-labelledby="settings-title" hidden>
       <div class="screen-heading"><div><p class="eyebrow">PREFERENCES</p><h1 id="settings-title">Settings</h1></div><button class="tiny-action" type="button" data-view="home" aria-label="Back home">×</button></div>
-      <div class="settings-panel"><div class="setting-row"><span>Voice replies</span><button id="sound-setting" class="toggle" type="button" aria-pressed="false" aria-label="Toggle voice replies"><i></i></button></div><label class="setting-row" for="language"><span>Speech language</span><select id="language"><option value="en-IN">English · India</option><option value="en-US">English · US</option><option value="en-GB">English · UK</option><option value="en-GH">English · Ghana</option></select></label><p class="screen-footnote">Voice phrase checks are a simulation, not speaker identity. Device approval remains required. The microphone is optional.</p></div>
+      <div class="settings-panel"><div class="setting-row"><span>Voice replies</span><button id="sound-setting" class="toggle" type="button" aria-pressed="false" aria-label="Toggle voice replies"><i></i></button></div><label class="setting-row" for="voice-phrase-enabled"><span>Extra spoken phrase check (demo)</span><input id="voice-phrase-enabled" type="checkbox"></label><label class="setting-row" for="language"><span>Speech language</span><select id="language"><option value="en-IN">English · India</option><option value="en-US">English · US</option><option value="en-GB">English · UK</option><option value="en-GH">English · Ghana</option></select></label><p class="screen-footnote">The phrase check does not identify your voice. Face ID, Touch ID, or device screen lock remains the payment approval.</p></div>
       <button id="reset" class="text-link reset-link" type="button">Reset demo</button>
       <button id="logout-settings" class="text-link reset-link" type="button">Sign out</button>
     </section>
