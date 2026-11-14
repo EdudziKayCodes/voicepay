@@ -417,9 +417,8 @@ function scheduleInactivityLogout() {
   const idleFor = Date.now() - app.lastActivity;
   const remaining = Math.max(0, 5 * 60 * 1000 - idleFor);
   app.inactivityTimer = setTimeout(() => {
-    if (Date.now() - app.lastActivity >= 5 * 60 * 1000) {
-      say('Signed out after 5 minutes of inactivity.', 'error');
-      logout();
+      if (Date.now() - app.lastActivity >= 5 * 60 * 1000) {
+      logout('inactivity');
     } else scheduleInactivityLogout();
   }, remaining);
 }
@@ -518,10 +517,8 @@ async function verifyPhoneCode() {
   finally { firebaseVerificationInProgress = false; $('verify-code').disabled = false; }
 }
 
-async function logout() {
+async function logout(reason) {
   if (app.inactivityTimer) { clearTimeout(app.inactivityTimer); app.inactivityTimer = null; }
-  if (firebaseAuth && firebaseModules) { try { await firebaseModules.signOut(firebaseAuth); } catch (e) { /* clear server session below */ } }
-  try { await api('/api/auth/logout', {}); } catch (e) { /* still clear the local view */ }
   firebaseSyncUid = null;
   app.authenticated = false;
   app.registered = false;
@@ -533,8 +530,12 @@ async function logout() {
   $('code-group').hidden = true;
   clearClientFlow();
   navigate('account');
-  await refresh();
-  say('Signed out.', 'ok');
+  say(reason === 'inactivity' ? 'Signed out after 5 minutes of inactivity.' : 'Signed out.', reason === 'inactivity' ? 'error' : 'ok');
+  const signOutFirebase = firebaseAuth && firebaseModules
+    ? firebaseModules.signOut(firebaseAuth).catch(() => {}) : Promise.resolve();
+  const clearServerSession = api('/api/auth/logout', {}).catch(() => {});
+  await Promise.all([signOutFirebase, clearServerSession]);
+  try { await refresh(); } catch (e) { /* the local account screen is already cleared */ }
 }
 
 async function pickContact() {
@@ -820,6 +821,7 @@ function startListening() {
   let heard = false;
   let failed = false;
   let finalTranscript = '';
+  let lastQueuedTranscript = '';
   rec.onstart = () => { setListening(true); say('Listening. Tap the mic to stop.'); };
   rec.onresult = (event) => {
     let interim = '';
@@ -830,9 +832,11 @@ function startListening() {
     }
     $('typed').value = (finalTranscript + interim).trim();
     if (interim) say('Hearing: ' + $('typed').value);
-    if (finalTranscript.trim() && !interim) {
+    const transcript = (finalTranscript + interim).trim();
+    if (transcript) {
       heard = true;
-      queueVoiceTranscript(finalTranscript.trim());
+      lastQueuedTranscript = transcript;
+      queueVoiceTranscript(transcript);
     }
   };
   rec.onerror = (event) => {
@@ -857,7 +861,9 @@ function startListening() {
   };
   rec.onend = () => {
     setListening(false);
-    if (!heard && !failed) say('I did not hear anything. Tap the mic when you are ready.');
+    const final = finalTranscript.trim();
+    if (final && final !== lastQueuedTranscript && !app.busy) queueVoiceTranscript(final);
+    else if (!heard && !failed) say('I did not hear anything. Tap the mic when you are ready.');
   };
   app.recognizer = rec;
   try { rec.start(); } catch (e) { say('Could not start the microphone. Try again.', 'error'); }
@@ -1234,7 +1240,7 @@ async function start() {
   }, { passive: true });
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && app.authenticated) {
-      if (Date.now() - app.lastActivity >= 5 * 60 * 1000) logout();
+      if (Date.now() - app.lastActivity >= 5 * 60 * 1000) logout('inactivity');
       else scheduleInactivityLogout();
     }
   });
