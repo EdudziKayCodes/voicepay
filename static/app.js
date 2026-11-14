@@ -57,6 +57,8 @@ const app = {
   selectedContact: null,
   inactivityTimer: null,
   lastActivity: Date.now(),
+  currentView: null,
+  payExitCleanup: null,
   voicePhrase: [],
   voicePhraseAttempts: 0,
   voicePhrasePassed: false,
@@ -171,6 +173,11 @@ function navigate(view, push) {
   if (!VIEWS.includes(view)) view = 'home';
   const requiresAccount = !app.authenticated && ['pay', 'balance', 'history', 'setup', 'settings'].includes(view);
   if (requiresAccount) view = 'account';
+  if (app.currentView === 'pay' && view !== 'pay') {
+    resetPaymentChat();
+    app.payExitCleanup = app.authenticated ? api('/api/cancel', {}).catch(() => {}) : Promise.resolve();
+  }
+  app.currentView = view;
   if (view !== 'balance') hideBalance();
   if (view !== 'history') hideHistory();
   document.querySelectorAll('[data-screen]').forEach((screen) => {
@@ -187,6 +194,22 @@ function navigate(view, push) {
   if (view === 'balance') prefetchReveal();
   if (view === 'history') prefetchHistory();
   if (requiresAccount) say('Verify your phone number to open this section.', 'error');
+}
+
+function resetPaymentChat() {
+  stopVoiceInput();
+  if (app.timer) { clearInterval(app.timer); app.timer = null; }
+  app.txn = null;
+  app.lastPayment = null;
+  app.selectedContact = null;
+  $('ticket').hidden = true;
+  $('receipt').hidden = true;
+  $('pay-tip').hidden = false;
+  $('typed').value = '';
+  $('recipient-phone').value = '';
+  $('log').textContent = '';
+  setChips(startChips());
+  addMessage('bot', 'Who would you like to pay?');
 }
 
 function clearClientFlow() {
@@ -285,6 +308,7 @@ async function botSay(text, expects, isError) {
 async function handleCommand(text, shown) {
   text = (text || '').trim();
   if (!text || app.busy) return;
+  if (app.payExitCleanup) { await app.payExitCleanup; app.payExitCleanup = null; }
   stopVoiceInput();
   const manualPhone = $('recipient-phone').value.trim();
   if (manualPhone && !app.selectedContact && !/\bto\b/i.test(text)) {
@@ -360,7 +384,10 @@ async function refresh() {
   app.currency = s.currency;
   app.country = s.country || 'IN';
   if ($('country-select') && s.authenticated) $('country-select').value = app.country;
+  const wasAuthenticated = app.authenticated;
   app.authenticated = Boolean(s.authenticated);
+  if (app.authenticated && !wasAuthenticated) { app.lastActivity = Date.now(); scheduleInactivityLogout(); }
+  if (!app.authenticated && app.inactivityTimer) { clearTimeout(app.inactivityTimer); app.inactivityTimer = null; }
   if (s.authenticated) app.accountIdentity = s.account_identity;
   app.registered = s.registered;
   $('setup-box').hidden = !s.authenticated || (s.registered && !app.addingDevice);
@@ -382,6 +409,25 @@ async function refresh() {
   if (!s.authenticated && ['pay', 'balance', 'history', 'setup', 'settings'].includes(location.hash.slice(1))) {
     navigate('account', false);
   }
+}
+
+function scheduleInactivityLogout() {
+  if (app.inactivityTimer) clearTimeout(app.inactivityTimer);
+  if (!app.authenticated) return;
+  const idleFor = Date.now() - app.lastActivity;
+  const remaining = Math.max(0, 5 * 60 * 1000 - idleFor);
+  app.inactivityTimer = setTimeout(() => {
+    if (Date.now() - app.lastActivity >= 5 * 60 * 1000) {
+      say('Signed out after 5 minutes of inactivity.', 'error');
+      logout();
+    } else scheduleInactivityLogout();
+  }, remaining);
+}
+
+function markInterfaceActivity() {
+  if (!app.authenticated) return;
+  app.lastActivity = Date.now();
+  scheduleInactivityLogout();
 }
 
 async function loadCountryOptions() {
@@ -1116,6 +1162,12 @@ function startChips() {
 /* ---------- start ---------- */
 
 async function start() {
+  window.addEventListener('offline', () => say('You are offline. Sign-in and payment actions need an internet connection.', 'error'));
+  window.addEventListener('online', () => say('Connection restored.', 'ok'));
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register('/service-worker.js', { scope: '/' })
+      .catch((error) => console.info('Offline app shell is unavailable:', error.message));
+  }
   document.querySelectorAll('[data-view]').forEach((button) => {
     button.addEventListener('click', () => navigate(button.dataset.view));
   });
@@ -1128,6 +1180,12 @@ async function start() {
     const text = input.value.trim();
     input.value = '';
     handleCommand(text);
+  });
+  $('typed').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      $('composer').requestSubmit();
+    }
   });
   $('typed').addEventListener('input', onTranscriptEdit);
   $('mic').addEventListener('click', onMic);
@@ -1168,17 +1226,18 @@ async function start() {
   $('verify-code').addEventListener('click', verifyPhoneCode);
   $('logout').addEventListener('click', logout);
   $('logout-settings').addEventListener('click', logout);
-  const resetInactivity = () => {
-    app.lastActivity = Date.now();
-    if (app.inactivityTimer) clearTimeout(app.inactivityTimer);
-    app.inactivityTimer = setTimeout(() => {
-      if (app.authenticated) { say('Signed out after 5 minutes of inactivity.', 'error'); logout(); }
-    }, 5 * 60 * 1000);
-  };
-  ['pointerdown', 'keydown', 'touchstart', 'input'].forEach((eventName) =>
-    document.addEventListener(eventName, resetInactivity, { passive: true }));
-  window.addEventListener('focus', resetInactivity);
-  resetInactivity();
+  ['pointerdown', 'keydown', 'touchstart', 'input', 'wheel', 'scroll'].forEach((eventName) =>
+    document.addEventListener(eventName, markInterfaceActivity, { passive: true }));
+  let lastPointerActivity = 0;
+  document.addEventListener('pointermove', () => {
+    if (Date.now() - lastPointerActivity > 1000) { lastPointerActivity = Date.now(); markInterfaceActivity(); }
+  }, { passive: true });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && app.authenticated) {
+      if (Date.now() - app.lastActivity >= 5 * 60 * 1000) logout();
+      else scheduleInactivityLogout();
+    }
+  });
   $('sound').textContent = '♫';
   $('sound').setAttribute('aria-pressed', 'false');
   $('language').value = LANG;

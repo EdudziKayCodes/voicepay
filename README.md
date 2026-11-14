@@ -19,6 +19,11 @@ The interface has separate Home, Pay, Balance, Activity, Device Security, and Se
 and Activity hide again when you leave their screens. The opening view introduces the demo before a
 visitor starts a payment.
 
+VoicePay can be installed as a PWA from its HTTPS address. On Android, use the browser's Install app
+or Add to Home screen action. On iPhone/iPad, open the site in Safari, tap Share, then Add to Home
+Screen. The service worker caches only the static app shell; sign-in, countries, balance, history, and
+payment actions still need a network connection and are never served from cache.
+
 The pay screen accepts a recipient name and an optional international phone number; browser contact
 selection is available where supported, with manual entry as fallback. A completed receipt can be
 dismissed to clear the chat while preserving the simulated payment in Activity. Voice transcripts are
@@ -107,6 +112,8 @@ In the Render dashboard create a **Web Service** from your GitHub repo and use e
 | Instance count | 1 (pending approvals and conversations are held in memory) |
 
 Use one worker: pending approvals and conversations live in process memory. Verified users have separate simulated balances, histories, country settings, and device credentials in SQLite.
+
+Render's Free web service has an ephemeral filesystem and may spin down or restart. This means the local SQLite users, passkeys, and simulated ledger can be lost, and in-memory pending approvals disappear on restart. Treat Free as a disposable demo only. For persistent data, use a paid persistent disk mounted at `/var/data` and set `VOICEPAY_LEDGER_DB=/var/data/voicepay.sqlite3`, or migrate the app to a managed database before using it with real users. The current app does not use Postgres directly.
 
 Under **Environment** add these variables:
 

@@ -1,0 +1,25 @@
+{
+  "id": "/",
+  "name": "VoicePay — Payment Simulation",
+  "short_name": "VoicePay",
+  "description": "A voice-first payment approval simulation.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#071426",
+  "theme_color": "#071426",
+  "icons": [
+    {
+      "src": "/icons/voicepay-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/voicepay-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
